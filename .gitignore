@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+
+# Coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
+build/
+build-*/
+dist/
+*.egg-info/
+.conan/
+.conan2/
+.cache/
+src/graphot/_core*.so
+src/graphot/_core*.pyd
+
+# Notebook artifacts
+.ipynb_checkpoints/
+
+# Example-generated outputs
+examples/output/
+examples/*/output/
+
+reference/
+
+.vscode
