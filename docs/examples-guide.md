@@ -71,7 +71,8 @@ Use it for:
 
 - testing the solver on a larger problem,
 - generating richer plots,
-- exploring debug traces on harder cases.
+- exploring debug traces on harder cases,
+- comparing large-solver settings and continuation schedules on the `32x32` setup.
 
 This is the most demanding example in the repository.
 
@@ -88,6 +89,16 @@ python examples/directed_reversible_transport/run.py
 python examples/large_grid_transport/run.py
 ```
 
+If your build includes OpenMP, the examples use all available CPU threads by
+default. To run with a different thread count, prefix the command with an
+environment variable:
+
+```bash
+GRAPHOT_NUM_THREADS=16 python examples/large_grid_transport/run.py
+```
+
+`OMP_NUM_THREADS=16 ...` also works if you already manage OpenMP that way.
+
 ## Typical Outputs
 
 Most example scripts write:
@@ -97,4 +108,5 @@ Most example scripts write:
 - an edge-flow plot,
 - a graph snapshot.
 
-The large-grid example can also save a debug trace when requested.
+The large-grid example saves debug traces by default. Use `--no-debug-trace`
+if you want to skip them.

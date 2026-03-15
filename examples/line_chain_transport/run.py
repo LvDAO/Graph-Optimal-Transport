@@ -13,17 +13,6 @@ def _bootstrap_examples_dir() -> None:
     examples_dir = Path(__file__).resolve().parents[1]
     if str(examples_dir) not in sys.path:
         sys.path.insert(0, str(examples_dir))
-
-
-
-def regularize_density(graph, rho: np.ndarray, mix: float) -> np.ndarray:
-    if not 0.0 <= mix < 1.0:
-        raise ValueError("mix must lie in [0, 1)")
-    uniform = np.ones(graph.num_nodes, dtype=np.float64)
-    return (1.0 - mix) * rho + mix * uniform
-
-
-
 def main() -> None:
     _bootstrap_examples_dir()
 
@@ -31,6 +20,7 @@ def main() -> None:
         dirac_density,
         path_graph,
         path_layout,
+        regularize_density,
         save_edge_flow_heatmap,
         save_graph_snapshot_series,
         save_node_mass_heatmap,

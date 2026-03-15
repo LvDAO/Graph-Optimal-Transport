@@ -22,6 +22,10 @@
 #include <immintrin.h>
 #endif
 
+#if defined(GRAPHOT_USE_OPENMP)
+#include <omp.h>
+#endif
+
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 #define GRAPHOT_HAS_TARGET_SIMD 1
 #else
@@ -33,6 +37,8 @@ namespace py = pybind11;
 namespace {
 
 constexpr double kTiny = 1e-30;
+constexpr std::size_t kParallelVectorOpsThreshold = 1u << 14;
+constexpr std::size_t kParallelWorkThreshold = 1u << 10;
 
 enum class SimdLevel {
     scalar,
@@ -181,6 +187,51 @@ const SimdOps& simd_ops() {
     return ops;
 }
 
+#if defined(GRAPHOT_USE_OPENMP)
+int g_graphot_openmp_threads = 1;
+const char* g_graphot_openmp_thread_source = "runtime_default";
+
+int graphot_default_openmp_threads() {
+    return std::max(1, omp_get_num_procs());
+}
+
+int parse_positive_thread_count(const char* raw_value, std::string_view env_name) {
+    if (raw_value == nullptr || raw_value[0] == '\0') {
+        throw std::invalid_argument(std::string(env_name) + " must be a positive integer");
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(raw_value, &end, 10);
+    if (end == raw_value || *end != '\0' || parsed <= 0 || parsed > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(std::string(env_name) + " must be a positive integer");
+    }
+    return static_cast<int>(parsed);
+}
+
+void configure_openmp_threads() {
+    const char* graphot_raw = std::getenv("GRAPHOT_NUM_THREADS");
+    const char* omp_raw = std::getenv("OMP_NUM_THREADS");
+    int configured_threads = graphot_default_openmp_threads();
+    const char* source = "all_available_threads";
+    if (graphot_raw != nullptr && graphot_raw[0] != '\0') {
+        configured_threads = parse_positive_thread_count(graphot_raw, "GRAPHOT_NUM_THREADS");
+        source = "GRAPHOT_NUM_THREADS";
+    } else if (omp_raw != nullptr && omp_raw[0] != '\0') {
+        configured_threads = parse_positive_thread_count(omp_raw, "OMP_NUM_THREADS");
+        source = "OMP_NUM_THREADS";
+    }
+    omp_set_num_threads(configured_threads);
+    g_graphot_openmp_threads = configured_threads;
+    g_graphot_openmp_thread_source = source;
+}
+#else
+constexpr int g_graphot_openmp_threads = 1;
+const char* g_graphot_openmp_thread_source = "serial_build";
+
+int graphot_default_openmp_threads() {
+    return 1;
+}
+#endif
+
 inline std::size_t row_major(int row, int col, int width) {
     return static_cast<std::size_t>(row) * static_cast<std::size_t>(width) + static_cast<std::size_t>(col);
 }
@@ -189,6 +240,40 @@ void check_size(std::size_t actual, std::size_t expected, std::string_view name)
     if (actual != expected) {
         throw std::invalid_argument(std::string(name) + " has unexpected size");
     }
+}
+
+void check_finite(const std::vector<double>& value, std::string_view name) {
+    const bool all_finite = std::all_of(value.begin(), value.end(), [](double x) {
+        return std::isfinite(x);
+    });
+    if (!all_finite) {
+        throw std::invalid_argument(std::string(name) + " must be finite");
+    }
+}
+
+bool should_parallelize(std::size_t work_items) {
+#if defined(GRAPHOT_USE_OPENMP)
+    return omp_get_max_threads() > 1 && work_items >= kParallelWorkThreshold;
+#else
+    (void)work_items;
+    return false;
+#endif
+}
+
+int graphot_openmp_max_threads() {
+#if defined(GRAPHOT_USE_OPENMP)
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
+int graphot_openmp_num_procs() {
+#if defined(GRAPHOT_USE_OPENMP)
+    return omp_get_num_procs();
+#else
+    return 1;
+#endif
 }
 
 void project_zero_mean(std::vector<double>& value) {
@@ -206,10 +291,45 @@ void project_zero_mean(std::vector<double>& value) {
 }
 
 void vector_axpy(std::vector<double>& dst, const std::vector<double>& src, double alpha) {
+#if defined(GRAPHOT_USE_OPENMP)
+    if (should_parallelize(dst.size()) && dst.size() >= kParallelVectorOpsThreshold) {
+#pragma omp parallel
+        {
+            const int num_threads = omp_get_num_threads();
+            const int thread_id = omp_get_thread_num();
+            const std::size_t chunk = (dst.size() + static_cast<std::size_t>(num_threads) - 1)
+                / static_cast<std::size_t>(num_threads);
+            const std::size_t begin = std::min(dst.size(), static_cast<std::size_t>(thread_id) * chunk);
+            const std::size_t end = std::min(dst.size(), begin + chunk);
+            if (begin < end) {
+                simd_ops().axpy(dst.data() + begin, src.data() + begin, alpha, end - begin);
+            }
+        }
+        return;
+    }
+#endif
     simd_ops().axpy(dst.data(), src.data(), alpha, dst.size());
 }
 
 double vector_dot(const std::vector<double>& left, const std::vector<double>& right) {
+#if defined(GRAPHOT_USE_OPENMP)
+    if (should_parallelize(left.size()) && left.size() >= kParallelVectorOpsThreshold) {
+        double total = 0.0;
+#pragma omp parallel reduction(+:total)
+        {
+            const int num_threads = omp_get_num_threads();
+            const int thread_id = omp_get_thread_num();
+            const std::size_t chunk = (left.size() + static_cast<std::size_t>(num_threads) - 1)
+                / static_cast<std::size_t>(num_threads);
+            const std::size_t begin = std::min(left.size(), static_cast<std::size_t>(thread_id) * chunk);
+            const std::size_t end = std::min(left.size(), begin + chunk);
+            if (begin < end) {
+                total += simd_ops().dot(left.data() + begin, right.data() + begin, end - begin);
+            }
+        }
+        return total;
+    }
+#endif
     return simd_ops().dot(left.data(), right.data(), left.size());
 }
 
@@ -358,6 +478,52 @@ struct SolveResult {
     double distance = 0.0;
     std::optional<DebugTrace> debug_trace;
 };
+
+std::optional<State> parse_initial_state(
+    py::handle initial_state_payload,
+    int num_steps,
+    int num_nodes,
+    int num_edges
+) {
+    if (initial_state_payload.is_none()) {
+        return std::nullopt;
+    }
+
+    const py::dict state_dict = py::cast<py::dict>(initial_state_payload);
+    auto load_array = [&](std::string_view name, std::size_t expected_size) {
+        const py::array_t<double, py::array::c_style | py::array::forcecast> array =
+            py::cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(state_dict[py::str(name)]);
+        check_size(array.size(), expected_size, name);
+        std::vector<double> out(array.data(), array.data() + array.size());
+        check_finite(out, name);
+        return out;
+    };
+
+    State state(num_steps, num_nodes, num_edges);
+    state.rho = load_array("rho", static_cast<std::size_t>(num_steps + 1) * static_cast<std::size_t>(num_nodes));
+    state.m = load_array("m", static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(num_edges));
+    state.vartheta = load_array(
+        "vartheta",
+        static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(num_edges)
+    );
+    state.rho_minus = load_array(
+        "rho_minus",
+        static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(num_edges)
+    );
+    state.rho_plus = load_array(
+        "rho_plus",
+        static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(num_edges)
+    );
+    state.rho_bar = load_array(
+        "rho_bar",
+        static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(num_nodes)
+    );
+    state.q_node = load_array(
+        "q_node",
+        static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(num_nodes)
+    );
+    return state;
+}
 
 class LogMeanOpsCpp {
   public:
@@ -628,6 +794,9 @@ State state_subtract(const State& left, const State& right) {
 
 double state_norm_weighted(const State& state, const GraphData& graph, int num_steps) {
     double total = 0.0;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for reduction(+:total) if(should_parallelize(static_cast<std::size_t>(num_steps + 1) * graph.num_nodes))
+#endif
     for (int step = 0; step <= num_steps; ++step) {
         for (int node = 0; node < graph.num_nodes; ++node) {
             const double weight = graph.pi[node];
@@ -635,6 +804,9 @@ double state_norm_weighted(const State& state, const GraphData& graph, int num_s
             total += weight * value * value;
         }
     }
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for reduction(+:total) if(should_parallelize(static_cast<std::size_t>(num_steps) * graph.num_edges))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         for (int edge = 0; edge < graph.num_edges; ++edge) {
             const double weight = graph.edge_weight[edge];
@@ -644,6 +816,11 @@ double state_norm_weighted(const State& state, const GraphData& graph, int num_s
             total += weight * state.rho_minus[edge_index] * state.rho_minus[edge_index];
             total += weight * state.rho_plus[edge_index] * state.rho_plus[edge_index];
         }
+    }
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for reduction(+:total) if(should_parallelize(static_cast<std::size_t>(num_steps) * graph.num_nodes))
+#endif
+    for (int step = 0; step < num_steps; ++step) {
         for (int node = 0; node < graph.num_nodes; ++node) {
             const double weight = graph.pi[node];
             const auto node_index = row_major(step, node, graph.num_nodes);
@@ -661,6 +838,9 @@ double dual_pair_norm_weighted(
     int num_steps
 ) {
     double total = 0.0;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for reduction(+:total) if(should_parallelize(static_cast<std::size_t>(num_steps) * graph.num_edges))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         for (int edge = 0; edge < graph.num_edges; ++edge) {
             const auto index = row_major(step, edge, graph.num_edges);
@@ -678,6 +858,9 @@ void init_split_state(
     int num_steps,
     State& state
 ) {
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(num_steps) * graph.num_nodes))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         for (int node = 0; node < graph.num_nodes; ++node) {
             const double avg = 0.5 * (
@@ -706,6 +889,9 @@ State initialize_state(
     int num_steps
 ) {
     State state(num_steps, graph.num_nodes, graph.num_edges);
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(num_steps + 1) * graph.num_nodes))
+#endif
     for (int step = 0; step <= num_steps; ++step) {
         const double alpha = static_cast<double>(step) / static_cast<double>(num_steps);
         for (int node = 0; node < graph.num_nodes; ++node) {
@@ -723,6 +909,9 @@ State build_trivial_state(
     int num_steps
 ) {
     State state(num_steps, graph.num_nodes, graph.num_edges);
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(num_steps + 1) * graph.num_nodes))
+#endif
     for (int step = 0; step <= num_steps; ++step) {
         std::copy(rho.begin(), rho.end(), state.rho.begin() + row_major(step, 0, graph.num_nodes));
     }
@@ -733,6 +922,10 @@ State build_trivial_state(
 double compute_action(const GraphData& graph, const State& state, int num_steps) {
     const double h = 1.0 / static_cast<double>(num_steps);
     double total = 0.0;
+    int infeasible = 0;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for reduction(+:total) reduction(|:infeasible) if(should_parallelize(static_cast<std::size_t>(num_steps) * graph.num_edges))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         for (int edge = 0; edge < graph.num_edges; ++edge) {
             const auto index = row_major(step, edge, graph.num_edges);
@@ -742,10 +935,13 @@ double compute_action(const GraphData& graph, const State& state, int num_steps)
             if (vartheta > 0.0) {
                 safe = (m * m) / vartheta;
             } else if (std::abs(m) > 1e-12) {
-                return std::numeric_limits<double>::infinity();
+                infeasible = 1;
             }
             total += h * graph.edge_weight[edge] * safe;
         }
+    }
+    if (infeasible != 0) {
+        return std::numeric_limits<double>::infinity();
     }
     return total;
 }
@@ -761,6 +957,9 @@ void continuity_residual(
 ) {
     out.assign(static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(graph.num_nodes), 0.0);
     const double h = 1.0 / static_cast<double>(num_steps);
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(num_steps) * (graph.num_nodes + graph.num_edges)))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         for (int node = 0; node < graph.num_nodes; ++node) {
             double delta = rho[row_major(step + 1, node, graph.num_nodes)]
@@ -773,8 +972,6 @@ void continuity_residual(
             }
             out[row_major(step, node, graph.num_nodes)] = delta / h;
         }
-    }
-    for (int step = 0; step < num_steps; ++step) {
         for (int edge = 0; edge < graph.num_edges; ++edge) {
             const double contribution = 0.5 * graph.q[edge] * (
                 m[row_major(step, graph.rev[edge], graph.num_edges)]
@@ -819,8 +1016,15 @@ void solve_tridiagonal_javg(const std::vector<double>& rhs, int num_steps, int n
     diag[num_steps - 1] = 1.25;
 
     out.assign(rhs.size(), 0.0);
-    std::vector<double> rhs_node(num_steps, 0.0);
-    std::vector<double> sol;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel if(should_parallelize(static_cast<std::size_t>(num_nodes) * num_steps))
+#endif
+    {
+        std::vector<double> rhs_node(num_steps, 0.0);
+        std::vector<double> sol;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp for schedule(static)
+#endif
     for (int node = 0; node < num_nodes; ++node) {
         for (int step = 0; step < num_steps; ++step) {
             rhs_node[step] = rhs[row_major(step, node, num_nodes)];
@@ -829,6 +1033,7 @@ void solve_tridiagonal_javg(const std::vector<double>& rhs, int num_steps, int n
         for (int step = 0; step < num_steps; ++step) {
             out[row_major(step, node, num_nodes)] = sol[step];
         }
+    }
     }
 }
 
@@ -843,6 +1048,9 @@ void project_javg(
     std::vector<double>& rho_bar_pr
 ) {
     std::vector<double> rhs(static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(num_nodes), 0.0);
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(rhs.size()))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         for (int node = 0; node < num_nodes; ++node) {
             double value = rho_bar[row_major(step, node, num_nodes)]
@@ -868,10 +1076,16 @@ void project_javg(
     solve_tridiagonal_javg(rhs, num_steps, num_nodes, lam);
 
     rho_pr = rho;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(num_nodes)))
+#endif
     for (int node = 0; node < num_nodes; ++node) {
         rho_pr[row_major(0, node, num_nodes)] = rho_a[node];
         rho_pr[row_major(num_steps, node, num_nodes)] = rho_b[node];
     }
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(num_steps - 1) * num_nodes))
+#endif
     for (int step = 1; step < num_steps; ++step) {
         for (int node = 0; node < num_nodes; ++node) {
             rho_pr[row_major(step, node, num_nodes)] = rho[row_major(step, node, num_nodes)]
@@ -882,6 +1096,9 @@ void project_javg(
         }
     }
     rho_bar_pr.resize(rho_bar.size());
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(rho_bar.size()))
+#endif
     for (std::size_t idx = 0; idx < rho_bar.size(); ++idx) {
         rho_bar_pr[idx] = rho_bar[idx] - lam[idx];
     }
@@ -902,9 +1119,15 @@ void prox_i_star_javg(
     project_javg(rho, rho_bar, rho_a, rho_b, num_steps, num_nodes, rho_pr, rho_bar_pr);
     rho_out.resize(rho.size());
     rho_bar_out.resize(rho_bar.size());
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(rho.size()))
+#endif
     for (std::size_t idx = 0; idx < rho.size(); ++idx) {
         rho_out[idx] = rho[idx] - rho_pr[idx];
     }
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(rho_bar.size()))
+#endif
     for (std::size_t idx = 0; idx < rho_bar.size(); ++idx) {
         rho_bar_out[idx] = rho_bar[idx] - rho_bar_pr[idx];
     }
@@ -918,6 +1141,9 @@ void project_jeq(
 ) {
     rho_bar_pr.resize(rho_bar.size());
     q_node_pr.resize(q_node.size());
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(rho_bar.size()))
+#endif
     for (std::size_t idx = 0; idx < rho_bar.size(); ++idx) {
         const double mid = 0.5 * (rho_bar[idx] + q_node[idx]);
         rho_bar_pr[idx] = mid;
@@ -936,6 +1162,9 @@ void project_jpm(
     std::vector<double>& rho_plus_pr
 ) {
     q_node_pr = q_node;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(num_steps) * (graph.num_nodes + graph.num_edges)))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         for (int edge = 0; edge < graph.num_edges; ++edge) {
             const double term = 0.5 * graph.q[edge] * (
@@ -950,6 +1179,9 @@ void project_jpm(
     }
     rho_minus_pr.resize(rho_minus.size());
     rho_plus_pr.resize(rho_plus.size());
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(rho_minus.size()))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         for (int edge = 0; edge < graph.num_edges; ++edge) {
             rho_minus_pr[row_major(step, edge, graph.num_edges)] =
@@ -977,9 +1209,15 @@ void prox_i_star_jpm(
     q_node_out.resize(q_node.size());
     rho_minus_out.resize(rho_minus.size());
     rho_plus_out.resize(rho_plus.size());
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(q_node.size()))
+#endif
     for (std::size_t idx = 0; idx < q_node.size(); ++idx) {
         q_node_out[idx] = q_node[idx] - q_pr[idx];
     }
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(rho_minus.size()))
+#endif
     for (std::size_t idx = 0; idx < rho_minus.size(); ++idx) {
         rho_minus_out[idx] = rho_minus[idx] - rho_minus_pr[idx];
         rho_plus_out[idx] = rho_plus[idx] - rho_plus_pr[idx];
@@ -995,6 +1233,9 @@ void prox_a_star(
 ) {
     vartheta_out.resize(vartheta.size());
     m_out.resize(m.size());
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(vartheta.size()))
+#endif
     for (std::size_t idx = 0; idx < vartheta.size(); ++idx) {
         const bool feasible = vartheta[idx] + 0.25 * m[idx] * m[idx] <= 0.0;
         double v = m[idx];
@@ -1045,6 +1286,9 @@ void project_k(
     rho_minus_pr.resize(rho_minus.size());
     rho_plus_pr.resize(rho_plus.size());
     vartheta_pr.resize(vartheta.size());
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(rho_minus.size()))
+#endif
     for (std::size_t idx = 0; idx < rho_minus.size(); ++idx) {
         const auto proj = project_k_point(mean, rho_minus[idx], rho_plus[idx], vartheta[idx]);
         rho_minus_pr[idx] = proj[0];
@@ -1062,23 +1306,24 @@ void apply_ceh_constraint_zero_boundary(
 ) {
     out.assign(static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(graph.num_nodes), 0.0);
     const double h = 1.0 / static_cast<double>(num_steps);
-
-    for (int node = 0; node < graph.num_nodes; ++node) {
-        out[row_major(0, node, graph.num_nodes)] = drho_int[row_major(0, node, graph.num_nodes)] / h;
-    }
-    for (int step = 1; step < num_steps - 1; ++step) {
-        for (int node = 0; node < graph.num_nodes; ++node) {
-            out[row_major(step, node, graph.num_nodes)] = (
-                drho_int[row_major(step, node, graph.num_nodes)]
-                - drho_int[row_major(step - 1, node, graph.num_nodes)]
-            ) / h;
-        }
-    }
-    for (int node = 0; node < graph.num_nodes; ++node) {
-        out[row_major(num_steps - 1, node, graph.num_nodes)] =
-            -drho_int[row_major(num_steps - 2, node, graph.num_nodes)] / h;
-    }
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(num_steps) * (graph.num_nodes + graph.num_edges)))
+#endif
     for (int step = 0; step < num_steps; ++step) {
+        for (int node = 0; node < graph.num_nodes; ++node) {
+            double value = 0.0;
+            if (step == 0) {
+                value = drho_int[row_major(0, node, graph.num_nodes)] / h;
+            } else if (step == num_steps - 1) {
+                value = -drho_int[row_major(num_steps - 2, node, graph.num_nodes)] / h;
+            } else {
+                value = (
+                    drho_int[row_major(step, node, graph.num_nodes)]
+                    - drho_int[row_major(step - 1, node, graph.num_nodes)]
+                ) / h;
+            }
+            out[row_major(step, node, graph.num_nodes)] = value;
+        }
         for (int edge = 0; edge < graph.num_edges; ++edge) {
             const double contribution = 0.5 * graph.q[edge] * (
                 dm[row_major(step, graph.rev[edge], graph.num_edges)]
@@ -1099,6 +1344,9 @@ void apply_ceh_constraint_transpose_zero_boundary(
     drho_int_adj.assign(static_cast<std::size_t>(num_steps - 1) * static_cast<std::size_t>(graph.num_nodes), 0.0);
     dm_adj.assign(static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(graph.num_edges), 0.0);
     const double h = 1.0 / static_cast<double>(num_steps);
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(drho_int_adj.size()))
+#endif
     for (int step = 0; step < num_steps - 1; ++step) {
         for (int node = 0; node < graph.num_nodes; ++node) {
             drho_int_adj[row_major(step, node, graph.num_nodes)] = (
@@ -1107,6 +1355,9 @@ void apply_ceh_constraint_transpose_zero_boundary(
             ) / h;
         }
     }
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(dm_adj.size()))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         for (int edge = 0; edge < graph.num_edges; ++edge) {
             dm_adj[row_major(step, edge, graph.num_edges)] = 0.5 * (
@@ -1126,6 +1377,9 @@ void apply_jacobi_preconditioner(
     out = value;
     project_zero_mean(out);
     const double h = 1.0 / static_cast<double>(num_steps);
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(out.size()))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         const double time_diag = (step == 0 || step == num_steps - 1) ? 1.0 / (h * h) : 2.0 / (h * h);
         for (int node = 0; node < graph.num_nodes; ++node) {
@@ -1150,25 +1404,31 @@ void apply_block_jacobi_preconditioner(
     std::vector<double> upper(num_steps, -1.0 / (h * h));
     lower[0] = 0.0;
     upper[num_steps - 1] = 0.0;
-
-    std::vector<double> diag(num_steps, 0.0);
-    std::vector<double> rhs_node(num_steps, 0.0);
-    std::vector<double> lower_node(num_steps, 0.0);
-    std::vector<double> upper_node(num_steps, 0.0);
-    std::vector<double> sol;
-
-    for (int node = 0; node < graph.num_nodes; ++node) {
-        const double pi_inv = 1.0 / std::max(graph.pi[node], kTiny);
-        for (int step = 0; step < num_steps; ++step) {
-            const double time_diag = (step == 0 || step == num_steps - 1) ? 1.0 / (h * h) : 2.0 / (h * h);
-            diag[step] = std::max((time_diag + 0.5 * graph.out_rate[node]) * pi_inv, 1e-12);
-            lower_node[step] = lower[step] * pi_inv;
-            upper_node[step] = upper[step] * pi_inv;
-            rhs_node[step] = out[row_major(step, node, graph.num_nodes)];
-        }
-        solve_tridiagonal(lower_node, diag, upper_node, rhs_node, sol);
-        for (int step = 0; step < num_steps; ++step) {
-            out[row_major(step, node, graph.num_nodes)] = sol[step];
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel if(should_parallelize(static_cast<std::size_t>(graph.num_nodes) * num_steps))
+#endif
+    {
+        std::vector<double> diag(num_steps, 0.0);
+        std::vector<double> rhs_node(num_steps, 0.0);
+        std::vector<double> lower_node(num_steps, 0.0);
+        std::vector<double> upper_node(num_steps, 0.0);
+        std::vector<double> sol;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp for schedule(static)
+#endif
+        for (int node = 0; node < graph.num_nodes; ++node) {
+            const double pi_inv = 1.0 / std::max(graph.pi[node], kTiny);
+            for (int step = 0; step < num_steps; ++step) {
+                const double time_diag = (step == 0 || step == num_steps - 1) ? 1.0 / (h * h) : 2.0 / (h * h);
+                diag[step] = std::max((time_diag + 0.5 * graph.out_rate[node]) * pi_inv, 1e-12);
+                lower_node[step] = lower[step] * pi_inv;
+                upper_node[step] = upper[step] * pi_inv;
+                rhs_node[step] = out[row_major(step, node, graph.num_nodes)];
+            }
+            solve_tridiagonal(lower_node, diag, upper_node, rhs_node, sol);
+            for (int step = 0; step < num_steps; ++step) {
+                out[row_major(step, node, graph.num_nodes)] = sol[step];
+            }
         }
     }
     project_zero_mean(out);
@@ -1194,6 +1454,9 @@ CgResult conjugate_gradient(
     matvec(x, ap);
 
     std::vector<double> r(b.size(), 0.0);
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(b.size()))
+#endif
     for (std::size_t idx = 0; idx < b.size(); ++idx) {
         r[idx] = b[idx] - ap[idx];
     }
@@ -1221,6 +1484,9 @@ CgResult conjugate_gradient(
         preconditioner(r, z);
         const double rz_new = vector_dot(r, z);
         const double beta = rz_new / std::max(rz_old, kTiny);
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(p.size()))
+#endif
         for (std::size_t idx = 0; idx < p.size(); ++idx) {
             p[idx] = z[idx] + beta * p[idx];
         }
@@ -1254,12 +1520,18 @@ void project_ceh(
         apply_ceh_constraint_transpose_zero_boundary(graph, phi_local, num_steps, drho_int_adj, dm_adj);
         std::vector<double> drho_int(drho_int_adj.size(), 0.0);
         std::vector<double> dm(dm_adj.size(), 0.0);
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(drho_int.size()))
+#endif
         for (int step = 0; step < num_steps - 1; ++step) {
             for (int node = 0; node < graph.num_nodes; ++node) {
                 drho_int[row_major(step, node, graph.num_nodes)] =
                     drho_int_adj[row_major(step, node, graph.num_nodes)] / std::max(graph.pi[node], kTiny);
             }
         }
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(dm.size()))
+#endif
         for (int step = 0; step < num_steps; ++step) {
             for (int edge = 0; edge < graph.num_edges; ++edge) {
                 dm[row_major(step, edge, graph.num_edges)] =
@@ -1293,10 +1565,16 @@ void project_ceh(
     apply_ceh_constraint_transpose_zero_boundary(graph, phi, num_steps, drho_int_adj, dm_adj);
 
     rho_pr = rho;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(graph.num_nodes)))
+#endif
     for (int node = 0; node < graph.num_nodes; ++node) {
         rho_pr[row_major(0, node, graph.num_nodes)] = rho_a[node];
         rho_pr[row_major(num_steps, node, graph.num_nodes)] = rho_b[node];
     }
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(num_steps - 1) * graph.num_nodes))
+#endif
     for (int step = 1; step < num_steps; ++step) {
         for (int node = 0; node < graph.num_nodes; ++node) {
             rho_pr[row_major(step, node, graph.num_nodes)] =
@@ -1305,6 +1583,9 @@ void project_ceh(
         }
     }
     m_pr = m;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(static_cast<std::size_t>(num_steps) * graph.num_edges))
+#endif
     for (int step = 0; step < num_steps; ++step) {
         for (int edge = 0; edge < graph.num_edges; ++edge) {
             m_pr[row_major(step, edge, graph.num_edges)] =
@@ -1418,6 +1699,9 @@ Diagnostics compute_diagnostics(
 
     std::vector<double> dual_m_diff = dual.m;
     std::vector<double> dual_vartheta_diff = dual.vartheta;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for if(should_parallelize(dual_m_diff.size()))
+#endif
     for (std::size_t idx = 0; idx < dual_m_diff.size(); ++idx) {
         dual_m_diff[idx] -= prev_dual.m[idx];
         dual_vartheta_diff[idx] -= prev_dual.vartheta[idx];
@@ -1428,11 +1712,17 @@ Diagnostics compute_diagnostics(
     std::vector<double> continuity;
     continuity_residual(graph, primal.rho, primal.m, rho_a, rho_b, num_steps, continuity);
     double continuity_max = 0.0;
-    for (double value : continuity) {
-        continuity_max = std::max(continuity_max, std::abs(value));
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for reduction(max:continuity_max) if(should_parallelize(continuity.size()))
+#endif
+    for (std::size_t idx = 0; idx < continuity.size(); ++idx) {
+        continuity_max = std::max(continuity_max, std::abs(continuity[idx]));
     }
 
     double k_violation = 0.0;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for reduction(max:k_violation) if(should_parallelize(primal.vartheta.size()))
+#endif
     for (std::size_t idx = 0; idx < primal.vartheta.size(); ++idx) {
         const double theta_value = mean.theta(primal.rho_minus[idx], primal.rho_plus[idx]);
         const double upper_slack = std::max(primal.vartheta[idx] - theta_value, 0.0);
@@ -1445,6 +1735,9 @@ Diagnostics compute_diagnostics(
     }
 
     double endpoint_residual = 0.0;
+#if defined(GRAPHOT_USE_OPENMP)
+#pragma omp parallel for reduction(max:endpoint_residual) if(should_parallelize(static_cast<std::size_t>(graph.num_nodes)))
+#endif
     for (int node = 0; node < graph.num_nodes; ++node) {
         endpoint_residual = std::max(endpoint_residual, std::abs(primal.rho[row_major(0, node, graph.num_nodes)] - rho_a[node]));
         endpoint_residual = std::max(
@@ -1508,7 +1801,8 @@ SolveResult run_solver(
     const std::vector<double>& rho_a,
     const std::vector<double>& rho_b,
     int num_steps,
-    const SolverConfig& config
+    const SolverConfig& config,
+    const std::optional<State>& initial_state
 ) {
     const double max_diff = [&]() {
         double diff = 0.0;
@@ -1542,9 +1836,13 @@ SolveResult run_solver(
         return result;
     }
 
-    State primal = config.linear_warm_start
-        ? build_linear_warm_start(graph, mean, rho_a, rho_b, num_steps, config)
-        : initialize_state(graph, mean, rho_a, rho_b, num_steps);
+    State primal = initial_state.has_value()
+        ? *initial_state
+        : (
+            config.linear_warm_start
+                ? build_linear_warm_start(graph, mean, rho_a, rho_b, num_steps, config)
+                : initialize_state(graph, mean, rho_a, rho_b, num_steps)
+        );
     State dual = zero_state_like(primal);
     State primal_bar = primal;
     std::vector<double> phi_cache(static_cast<std::size_t>(num_steps) * static_cast<std::size_t>(graph.num_nodes), 0.0);
@@ -1686,7 +1984,8 @@ py::dict solve_ot_cpp(
     double mean_eps_diag,
     double mean_xi_max,
     int mean_newton_iters,
-    int mean_bisect_iters
+    int mean_bisect_iters,
+    py::object initial_state_payload
 ) {
     check_size(src.size(), static_cast<std::size_t>(num_edges), "src");
     check_size(dst.size(), static_cast<std::size_t>(num_edges), "dst");
@@ -1727,7 +2026,21 @@ py::dict solve_ot_cpp(
     LogMeanOpsCpp mean(mean_config);
     std::vector<double> rho_a_vec(rho_a.data(), rho_a.data() + rho_a.size());
     std::vector<double> rho_b_vec(rho_b.data(), rho_b.data() + rho_b.size());
-    SolveResult result = run_solver(graph, mean, rho_a_vec, rho_b_vec, num_steps, solver_config);
+    const std::optional<State> initial_state =
+        parse_initial_state(initial_state_payload, num_steps, num_nodes, num_edges);
+    SolveResult result;
+    {
+        py::gil_scoped_release release;
+        result = run_solver(
+            graph,
+            mean,
+            rho_a_vec,
+            rho_b_vec,
+            num_steps,
+            solver_config,
+            initial_state
+        );
+    }
 
     py::dict payload;
     payload["rho"] = make_array_from_vector(result.state.rho, {num_steps + 1, num_nodes});
@@ -1795,6 +2108,17 @@ py::dict extension_info() {
 #else
         false;
 #endif
+    info["compiled_with_openmp"] =
+#if defined(GRAPHOT_USE_OPENMP)
+        true;
+#else
+        false;
+#endif
+    info["openmp_thread_source"] = std::string(g_graphot_openmp_thread_source);
+    info["configured_openmp_threads"] = g_graphot_openmp_threads;
+    info["default_openmp_threads"] = graphot_default_openmp_threads();
+    info["openmp_max_threads"] = graphot_openmp_max_threads();
+    info["openmp_num_procs"] = graphot_openmp_num_procs();
     return info;
 }
 
@@ -1802,6 +2126,9 @@ py::dict extension_info() {
 
 PYBIND11_MODULE(_core, module) {
     module.doc() = "C++ CPU solver core for graphot";
+#if defined(GRAPHOT_USE_OPENMP)
+    configure_openmp_threads();
+#endif
     module.def("solve_ot_cpp", &solve_ot_cpp);
     module.def("extension_info", &extension_info);
 }

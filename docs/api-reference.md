@@ -75,6 +75,28 @@ Most users only need these fields:
 The defaults are a good starting point. Tune further only if a problem is slow
 or does not converge.
 
+## CPU Thread Control
+
+`OTConfig` does not control CPU threading.
+
+If the installed `graphot` build includes OpenMP, the solver uses all available
+CPU threads by default. To override that, set an environment variable before
+Python starts:
+
+```bash
+GRAPHOT_NUM_THREADS=16 python your_script.py
+```
+
+If you already use standard OpenMP environment settings, `OMP_NUM_THREADS` is
+also respected:
+
+```bash
+OMP_NUM_THREADS=16 python your_script.py
+```
+
+If `graphot` was built without OpenMP, solves run single-threaded regardless of
+these settings.
+
 ## `OTProblem`
 
 ```python
@@ -99,10 +121,13 @@ Requirements for `rho_a` and `rho_b`:
 ## `solve_ot`
 
 ```python
-solution = solve_ot(problem, config=OTConfig())
+solution = solve_ot(problem, config=OTConfig(), initial_state=None)
 ```
 
 This is the main entry point.
+
+`initial_state` is optional. Pass a previous `solution.state` when you want to
+warm-start a nearby solve, for example in a continuation scheme.
 
 It returns an `OTSolution`.
 

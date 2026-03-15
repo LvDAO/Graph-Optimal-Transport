@@ -42,6 +42,30 @@ def _validate_density(name: str, rho: Array, pi: Array, num_nodes: int) -> None:
         raise ValueError(f"{name} must satisfy sum(pi * rho) == 1")
 
 
+def _validate_initial_state(initial_state: OTState, problem: OTProblem) -> None:
+    """Validate an explicit warm-start state against the current problem shape."""
+
+    num_steps = int(problem.time.num_steps)
+    num_nodes = int(problem.graph.num_nodes)
+    num_edges = int(problem.graph.num_edges)
+    expected_shapes = {
+        "rho": (num_steps + 1, num_nodes),
+        "m": (num_steps, num_edges),
+        "vartheta": (num_steps, num_edges),
+        "rho_minus": (num_steps, num_edges),
+        "rho_plus": (num_steps, num_edges),
+        "rho_bar": (num_steps, num_nodes),
+        "q_node": (num_steps, num_nodes),
+    }
+
+    for name, shape in expected_shapes.items():
+        value = np.asarray(getattr(initial_state, name), dtype=np.float64)
+        if value.shape != shape:
+            raise ValueError(f"initial_state.{name} must have shape {shape}")
+        if np.any(~np.isfinite(value)):
+            raise ValueError(f"initial_state.{name} must be finite")
+
+
 def compute_action(problem: OTProblem, state: OTState) -> np.float64:
     """Compute the discrete transport action for a solved state."""
 
@@ -141,7 +165,11 @@ def _wrap_cpp_result(payload: dict[str, object]) -> OTSolution:
     )
 
 
-def _solve_ot_cpp(problem: OTProblem, config: OTConfig) -> OTSolution:
+def _solve_ot_cpp(
+    problem: OTProblem,
+    config: OTConfig,
+    initial_state: OTState | None = None,
+) -> OTSolution:
     """Call the compiled backend and wrap the returned payload."""
 
     _require_core_backend()
@@ -149,6 +177,19 @@ def _solve_ot_cpp(problem: OTProblem, config: OTConfig) -> OTSolution:
     mean_ops = problem.mean_ops
     if not isinstance(mean_ops, LogMeanOps):
         raise TypeError("only LogMeanOps is supported by the current runtime")
+
+    initial_state_payload = None
+    if initial_state is not None:
+        _validate_initial_state(initial_state, problem)
+        initial_state_payload = {
+            "rho": np.asarray(initial_state.rho, dtype=np.float64),
+            "m": np.asarray(initial_state.m, dtype=np.float64),
+            "vartheta": np.asarray(initial_state.vartheta, dtype=np.float64),
+            "rho_minus": np.asarray(initial_state.rho_minus, dtype=np.float64),
+            "rho_plus": np.asarray(initial_state.rho_plus, dtype=np.float64),
+            "rho_bar": np.asarray(initial_state.rho_bar, dtype=np.float64),
+            "q_node": np.asarray(initial_state.q_node, dtype=np.float64),
+        }
 
     payload = _core_backend.solve_ot_cpp(
         int(graph.num_nodes),
@@ -180,12 +221,22 @@ def _solve_ot_cpp(problem: OTProblem, config: OTConfig) -> OTSolution:
         float(mean_ops.xi_max),
         int(mean_ops.newton_iters),
         int(mean_ops.bisect_iters),
+        initial_state_payload,
     )
     return _wrap_cpp_result(payload)
 
 
-def solve_ot(problem: OTProblem, config: OTConfig = OTConfig()) -> OTSolution:
-    """Solve the two-endpoint dynamic OT problem on a sparse reversible graph."""
+def solve_ot(
+    problem: OTProblem,
+    config: OTConfig = OTConfig(),
+    *,
+    initial_state: OTState | None = None,
+) -> OTSolution:
+    """Solve the two-endpoint dynamic OT problem on a sparse reversible graph.
+
+    ``initial_state`` may be set to a previous ``solution.state`` to warm-start
+    a nearby solve.
+    """
 
     _validate_density("rho_a", problem.rho_a, problem.graph.pi, problem.graph.num_nodes)
     _validate_density("rho_b", problem.rho_b, problem.graph.pi, problem.graph.num_nodes)
@@ -229,4 +280,4 @@ def solve_ot(problem: OTProblem, config: OTConfig = OTConfig()) -> OTSolution:
             debug_trace=debug_trace,
         )
 
-    return _solve_ot_cpp(problem, config)
+    return _solve_ot_cpp(problem, config, initial_state=initial_state)

@@ -31,6 +31,27 @@ These docs use the public import path `graphot`:
 from graphot import solve_ot
 ```
 
+## CPU Threads
+
+If your build includes OpenMP, `graphot` uses all available CPU threads by
+default.
+
+To pick a different thread count, set an environment variable before Python
+starts:
+
+```bash
+GRAPHOT_NUM_THREADS=16 python your_script.py
+```
+
+If you already manage OpenMP settings globally, `OMP_NUM_THREADS` is also
+respected:
+
+```bash
+OMP_NUM_THREADS=16 python your_script.py
+```
+
+If `graphot` was built without OpenMP support, solves stay single-threaded.
+
 ## Quick Start
 
 ```python

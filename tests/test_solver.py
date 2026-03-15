@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -77,6 +78,34 @@ def _directed_reversible_problem(*, num_steps: int) -> OTProblem:
     )
 
 
+def _extension_info_in_subprocess(*, graphot_num_threads: str | None, omp_num_threads: str | None) -> dict[str, object]:
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    if graphot_num_threads is None:
+        env.pop("GRAPHOT_NUM_THREADS", None)
+    else:
+        env["GRAPHOT_NUM_THREADS"] = graphot_num_threads
+    if omp_num_threads is None:
+        env.pop("OMP_NUM_THREADS", None)
+    else:
+        env["OMP_NUM_THREADS"] = omp_num_threads
+    script = """
+import json
+from graphot import _core
+print(json.dumps(_core.extension_info(), sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(completed.stdout.strip())
+
+
 @pytest.fixture(scope="module")
 def debug_trace_solution():
     problem = _two_node_problem(-0.2, 0.2, num_steps=12)
@@ -103,6 +132,48 @@ def test_config_rejects_legacy_mode_with_migration_message() -> None:
         OTConfig(numerics_mode="legacy")
 
 
+def test_openmp_defaults_to_all_available_threads_when_thread_envs_are_unset() -> None:
+    info = _extension_info_in_subprocess(graphot_num_threads=None, omp_num_threads=None)
+    if not bool(info["compiled_with_openmp"]):
+        assert info["configured_openmp_threads"] == 1
+        assert info["openmp_max_threads"] == 1
+        assert info["openmp_thread_source"] == "serial_build"
+        return
+
+    assert info["default_openmp_threads"] == info["openmp_num_procs"]
+    assert info["configured_openmp_threads"] == info["openmp_num_procs"]
+    assert info["openmp_max_threads"] == info["openmp_num_procs"]
+    assert info["openmp_thread_source"] == "all_available_threads"
+
+
+@pytest.mark.parametrize(
+    ("graphot_num_threads", "omp_num_threads", "expected_threads", "expected_source"),
+    [
+        ("7", None, 7, "GRAPHOT_NUM_THREADS"),
+        (None, "9", 9, "OMP_NUM_THREADS"),
+    ],
+)
+def test_openmp_respects_thread_env_overrides(
+    graphot_num_threads: str | None,
+    omp_num_threads: str | None,
+    expected_threads: int,
+    expected_source: str,
+) -> None:
+    info = _extension_info_in_subprocess(
+        graphot_num_threads=graphot_num_threads,
+        omp_num_threads=omp_num_threads,
+    )
+    if not bool(info["compiled_with_openmp"]):
+        assert info["configured_openmp_threads"] == 1
+        assert info["openmp_max_threads"] == 1
+        assert info["openmp_thread_source"] == "serial_build"
+        return
+
+    assert info["configured_openmp_threads"] == expected_threads
+    assert info["openmp_max_threads"] == expected_threads
+    assert info["openmp_thread_source"] == expected_source
+
+
 def test_solver_zero_distance_for_identical_endpoints() -> None:
     problem = _two_node_problem(0.2, 0.2, num_steps=12)
     solution = solve_ot(
@@ -116,6 +187,25 @@ def test_solver_zero_distance_for_identical_endpoints() -> None:
     assert float(solution.distance) < 1e-6
     assert solution.converged
     assert solution.iterations_used == 1
+
+
+def test_solver_accepts_explicit_initial_state() -> None:
+    seed_problem = _two_node_problem(-0.2, 0.2, num_steps=16)
+    target_problem = _two_node_problem(-0.1, 0.3, num_steps=16)
+    config = OTConfig(max_iters=240, check_every=10, tol=1e-8, cg_max_iters=96)
+
+    seed_solution = solve_ot(seed_problem, config)
+    direct_solution = solve_ot(target_problem, config)
+    warm_started_solution = solve_ot(
+        target_problem,
+        config,
+        initial_state=seed_solution.state,
+    )
+
+    assert direct_solution.converged
+    assert warm_started_solution.converged
+    assert np.isfinite(warm_started_solution.action)
+    assert abs(float(direct_solution.distance) - float(warm_started_solution.distance)) < 1e-8
 
 
 @pytest.mark.parametrize(

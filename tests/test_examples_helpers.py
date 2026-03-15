@@ -20,6 +20,7 @@ block_density = _COMMON.block_density
 grid_graph = _COMMON.grid_graph
 grid_layout = _COMMON.grid_layout
 estimate_state_memory_bytes = _COMMON.estimate_state_memory_bytes
+regularize_density = _COMMON.regularize_density
 save_debug_trace_npz = _COMMON.save_debug_trace_npz
 save_debug_trace_plot = _COMMON.save_debug_trace_plot
 
@@ -43,6 +44,15 @@ def test_block_density_normalizes_mass_correctly() -> None:
     rho = block_density(graph, 4, rows=range(2), cols=range(2))
     mass = np.asarray(graph.pi) * rho
     assert np.all(rho >= 0)
+    np.testing.assert_allclose(np.sum(mass), 1.0, atol=1e-12)
+
+
+def test_regularize_density_preserves_mass_normalization() -> None:
+    graph = grid_graph(4)
+    rho = block_density(graph, 4, rows=range(2), cols=range(2))
+    regularized = regularize_density(graph, rho, 0.25)
+    mass = np.asarray(graph.pi) * regularized
+    assert np.all(regularized >= 0)
     np.testing.assert_allclose(np.sum(mass), 1.0, atol=1e-12)
 
 

@@ -5,7 +5,7 @@ from conan import ConanFile
 
 class GraphOTConan(ConanFile):
     name = "graphot-core"
-    version = "0.0.2"
+    version = "0.0.3"
     package_type = "application"
 
     settings = "os", "arch", "build_type"

@@ -80,6 +80,18 @@ def dirac_density(graph: GraphSpec, node: int) -> np.ndarray:
     return rho
 
 
+def regularize_density(graph: GraphSpec, rho: Iterable[float], mix: float) -> np.ndarray:
+    if not 0.0 <= mix < 1.0:
+        raise ValueError("mix must lie in [0, 1)")
+
+    rho_arr = np.asarray(rho, dtype=np.float64)
+    if rho_arr.shape != (graph.num_nodes,):
+        raise ValueError(f"rho must have shape ({graph.num_nodes},)")
+
+    uniform = np.ones(graph.num_nodes, dtype=np.float64)
+    return (1.0 - mix) * rho_arr + mix * uniform
+
+
 def block_density(
     graph: GraphSpec,
     side: int,
@@ -128,11 +140,13 @@ def solve_problem(
     *,
     num_steps: int,
     config: OTConfig = DEFAULT_CONFIG,
+    initial_state=None,
 ):
     """Solve one OT instance for examples.
 
     The runtime always uses the paper-style weighted ``CE_h`` path.
     ``OTConfig.numerics_mode`` is kept for compatibility and must be ``"paper"``.
+    ``initial_state`` may warm-start a nearby solve.
     """
 
     problem = OTProblem(
@@ -142,7 +156,7 @@ def solve_problem(
         rho_b=np.asarray(rho_b, dtype=np.float64),
         mean_ops=LogMeanOps(),
     )
-    return solve_ot(problem, config)
+    return solve_ot(problem, config, initial_state=initial_state)
 
 
 def ensure_output_dir(output_dir: Path) -> Path:
