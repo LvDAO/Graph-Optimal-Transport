@@ -171,11 +171,13 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  publish:
+  publish_testpypi:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
     needs:
       - build_wheels
       - build_sdist
+    environment: testpypi
     permissions:
       contents: read
       id-token: write
@@ -188,20 +190,30 @@ jobs:
           merge-multiple: true
 
       - name: Publish to TestPyPI
-        if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist
 
-      - name: Publish to PyPI (manual)
-        if: github.event_name == 'workflow_dispatch' && inputs.target == 'pypi'
-        uses: pypa/gh-action-pypi-publish@release/v1
+  publish_pypi:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    needs:
+      - build_wheels
+      - build_sdist
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
         with:
-          packages-dir: dist
+          pattern: "*"
+          path: dist
+          merge-multiple: true
 
-      - name: Publish to PyPI (tag)
-        if: github.event_name == 'push'
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
