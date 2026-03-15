@@ -119,6 +119,7 @@ jobs:
           CIBW_BUILD_FRONTEND: "build[uv]"
           CIBW_BUILD: "cp311-* cp312-* cp313-*"
           CIBW_SKIP: "pp* *-musllinux*"
+          CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
           CIBW_ARCHS_LINUX: ${{ matrix.cibw_archs_linux }}
           CIBW_ARCHS_WINDOWS: ${{ matrix.cibw_archs_windows }}
           CIBW_ARCHS_MACOS: ${{ matrix.cibw_archs_macos }}
