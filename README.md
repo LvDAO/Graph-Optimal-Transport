@@ -10,17 +10,20 @@ Use it when you want:
 
 ## Install
 
-From the repository root:
+Install from PyPI:
 
 ```bash
-pip install .
+pip install graphot
 ```
 
 If you want to run the plotting examples:
 
 ```bash
-pip install ".[examples]"
+pip install "graphot[examples]"
 ```
+
+If you are working from a local checkout instead, run `pip install .` or
+`pip install ".[examples]"` from the repository root.
 
 These docs use the public import path `graphot`:
 

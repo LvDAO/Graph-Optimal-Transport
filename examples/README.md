@@ -2,11 +2,14 @@
 
 This folder contains runnable examples for `graphot`.
 
-To run the plotting examples from the repository root:
+Install the package with plotting dependencies:
 
 ```bash
-pip install ".[examples]"
+pip install "graphot[examples]"
 ```
+
+If you are running from a local checkout, `pip install ".[examples]"` from the
+repository root works too.
 
 ## Included Scripts
 

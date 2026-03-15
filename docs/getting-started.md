@@ -4,17 +4,20 @@ This page shows the shortest path to a correct first solve.
 
 ## Install
 
-From the repository root:
+Install from PyPI:
 
 ```bash
-pip install .
+pip install graphot
 ```
 
 If you want the plotting examples:
 
 ```bash
-pip install ".[examples]"
+pip install "graphot[examples]"
 ```
+
+If you are running from a local checkout, use `pip install .` or
+`pip install ".[examples]"` from the repository root instead.
 
 The public import path used in these docs is:
 
