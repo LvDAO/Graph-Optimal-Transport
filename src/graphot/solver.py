@@ -22,7 +22,8 @@ def _require_core_backend() -> None:
 
     if _core_backend is None:
         raise RuntimeError(
-            "the graphot._core extension is unavailable; reinstall graphot so the C++ backend builds correctly"
+            "the graphot._core extension is unavailable; reinstall graphot "
+            "so the C++ backend builds correctly"
         )
 
 
