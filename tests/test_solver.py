@@ -78,7 +78,11 @@ def _directed_reversible_problem(*, num_steps: int) -> OTProblem:
     )
 
 
-def _extension_info_in_subprocess(*, graphot_num_threads: str | None, omp_num_threads: str | None) -> dict[str, object]:
+def _extension_info_in_subprocess(
+    *,
+    graphot_num_threads: str | None,
+    omp_num_threads: str | None,
+) -> dict[str, object]:
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
