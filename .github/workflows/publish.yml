@@ -95,8 +95,14 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
       - name: Verify tag matches package version
         if: github.event_name == 'push'
+        shell: bash
         run: |
           python - <<'PY'
           import tomllib
@@ -115,6 +121,7 @@ jobs:
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.21.3
         env:
+          CIBW_BUILD_FRONTEND: "build[uv]"
           CIBW_BUILD: "cp311-* cp312-* cp313-*"
           CIBW_SKIP: "pp* *-musllinux*"
           CIBW_ARCHS_LINUX: ${{ matrix.cibw_archs_linux }}
