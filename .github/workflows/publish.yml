@@ -76,11 +76,6 @@ jobs:
             cibw_archs_linux: auto
             cibw_archs_windows: AMD64
             cibw_archs_macos: auto
-          - os: macos-15-intel
-            artifact_name: wheels-macos-x86_64
-            cibw_archs_linux: auto
-            cibw_archs_windows: auto
-            cibw_archs_macos: x86_64
           - os: macos-14
             artifact_name: wheels-macos-arm64
             cibw_archs_linux: auto

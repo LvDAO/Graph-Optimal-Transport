@@ -22,6 +22,12 @@
 #include <immintrin.h>
 #endif
 
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+#define GRAPHOT_HAS_TARGET_SIMD 1
+#else
+#define GRAPHOT_HAS_TARGET_SIMD 0
+#endif
+
 namespace py = pybind11;
 
 namespace {
@@ -48,7 +54,7 @@ void axpy_scalar(double* dst, const double* src, double alpha, std::size_t size)
     }
 }
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if GRAPHOT_HAS_TARGET_SIMD
 __attribute__((target("avx2,fma"))) double dot_avx2(const double* left, const double* right, std::size_t size) {
     std::size_t idx = 0;
     __m256d acc = _mm256_setzero_pd();
@@ -138,7 +144,7 @@ SimdOps resolve_simd() {
 
     auto scalar = SimdOps{dot_scalar, axpy_scalar, SimdLevel::scalar, "scalar"};
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if GRAPHOT_HAS_TARGET_SIMD
     auto avx2 = SimdOps{dot_avx2, axpy_avx2, SimdLevel::avx2, "avx2"};
     auto avx512 = SimdOps{dot_avx512, axpy_avx512, SimdLevel::avx512, "avx512"};
 
