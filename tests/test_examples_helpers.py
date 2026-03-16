@@ -82,6 +82,8 @@ def test_save_debug_trace_helpers(tmp_path: Path) -> None:
         continuity_residual=np.array([1e-2, 1e-3, 1e-4], dtype=np.float64),
         primal_delta=np.array([1e-1, 1e-2, 1e-3], dtype=np.float64),
         dual_delta=np.array([1e-1, 1e-2, 1e-3], dtype=np.float64),
+        k_violation=np.array([5e-3, 4e-4, 3e-5], dtype=np.float64),
+        endpoint_residual=np.array([2e-3, 2e-4, 2e-5], dtype=np.float64),
         max_constraint_residual=np.array([1e-2, 1e-3, 1e-4], dtype=np.float64),
         ceh_cg_residual=np.array([1e-3, 1e-4, 1e-5], dtype=np.float64),
         ceh_cg_iters=np.array([10, 12, 14], dtype=np.int32),
@@ -92,3 +94,6 @@ def test_save_debug_trace_helpers(tmp_path: Path) -> None:
     png_path = save_debug_trace_plot(tmp_path, "trace_test", trace, title="trace test")
     assert npz_path.exists()
     assert png_path.exists()
+    payload = np.load(npz_path)
+    assert "k_violation" in payload
+    assert "endpoint_residual" in payload

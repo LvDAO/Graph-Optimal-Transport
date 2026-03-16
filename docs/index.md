@@ -1,26 +1,65 @@
 # graphot Documentation
 
-Welcome to the user guide for `graphot`.
+This documentation is written for users who want to solve dynamic optimal
+transport problems on sparse reversible graphs from Python.
 
-`graphot` computes dynamic optimal transport on sparse reversible graphs. You give
-it a graph, two endpoint distributions, and a time discretization. It returns a
-transport path, edge flows, and a distance value.
-
-## Read In This Order
+If you are new to the project, the fastest path is:
 
 1. [Getting Started](getting-started.md)
 2. [Graph Model](graph-model.md)
-3. [API Reference](api-reference.md)
-4. [Examples Guide](examples-guide.md)
+3. [Examples Guide](examples-guide.md)
+4. [API Reference](api-reference.md)
+
+If you are already running larger problems, these pages matter next:
+
 5. [Debugging and Diagnostics](debugging-and-diagnostics.md)
 6. [Numerical Limitations](numerical-limitations.md)
 
-## What Each Page Covers
+## Choose A Starting Point
 
-- [Getting Started](getting-started.md): install, first solve, and the most important input rule.
-- [Graph Model](graph-model.md): how to build a graph and when to use each constructor.
-- [API Reference](api-reference.md): the main classes, functions, and result fields.
-- [Examples Guide](examples-guide.md): what each example script is good for.
-- [Solver Overview](solver-overview.md): a high-level view of what the solver computes.
-- [Debugging and Diagnostics](debugging-and-diagnostics.md): what to check when a run does not converge.
-- [Numerical Limitations](numerical-limitations.md): where the current solver is strong and where you should be cautious.
+Read [Getting Started](getting-started.md) if you want:
+- installation instructions,
+- a first complete solve,
+- the endpoint normalization rule,
+- a safe first large-grid command.
+
+Read [Graph Model](graph-model.md) if you want:
+- to build graphs correctly,
+- to understand `graph.pi`,
+- to decide between `from_undirected_weights(...)` and
+  `from_directed_rates(...)`.
+
+Read [Examples Guide](examples-guide.md) if you want:
+- runnable scripts,
+- recommended example order,
+- large-grid commands,
+- trace and warm-start example usage.
+
+Read [API Reference](api-reference.md) if you want:
+- the public import surface,
+- the main config fields,
+- warm-start modes,
+- result and trace fields.
+
+Read [Debugging and Diagnostics](debugging-and-diagnostics.md) if:
+- `converged` is `False`,
+- `action` becomes non-finite,
+- the trace starts looking unstable,
+- or you are tuning large-grid runs.
+
+Read [Numerical Limitations](numerical-limitations.md) if:
+- you are planning larger experiments,
+- you want to know where the current solver is reliable,
+- or you need realistic expectations before a longer run.
+
+## Current Scope
+
+`graphot` currently focuses on:
+- sparse reversible graphs,
+- CPU solves from Python,
+- NumPy-friendly outputs,
+- and explicit transport paths over time.
+
+Large-grid runs are supported as exploratory workloads, but they are still the
+hardest part of the current package. Use the diagnostics and examples when you
+scale up.

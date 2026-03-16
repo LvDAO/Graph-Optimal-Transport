@@ -9,6 +9,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 
@@ -54,22 +55,37 @@ endif()
 
 find_package(pybind11 CONFIG REQUIRED)
 
-pybind11_add_module(_core MODULE cpp/graphot_core.cpp)
+add_library(
+  graphot_core_internal
+  STATIC
+    cpp/src/runtime.cpp
+    cpp/src/mean_ops.cpp
+    cpp/src/state_ops.cpp
+    cpp/src/ceh_linear.cpp
+    cpp/src/prox_operators.cpp
+    cpp/src/solver.cpp
+)
+target_compile_features(graphot_core_internal PRIVATE cxx_std_20)
+target_include_directories(graphot_core_internal PUBLIC "${CMAKE_SOURCE_DIR}/cpp/include")
+
+pybind11_add_module(_core MODULE cpp/module.cpp cpp/src/pybind_io.cpp)
 target_compile_features(_core PRIVATE cxx_std_20)
 target_compile_definitions(_core PRIVATE PYBIND11_DETAILED_ERROR_MESSAGES=1)
-target_include_directories(_core PRIVATE "${CMAKE_SOURCE_DIR}/cpp")
+target_include_directories(_core PRIVATE "${CMAKE_SOURCE_DIR}/cpp/include")
+target_link_libraries(_core PRIVATE graphot_core_internal)
 
 if(GRAPHOT_ENABLE_OPENMP)
   find_package(OpenMP)
   if(OpenMP_CXX_FOUND)
-    target_link_libraries(_core PRIVATE OpenMP::OpenMP_CXX)
-    target_compile_definitions(_core PRIVATE GRAPHOT_USE_OPENMP=1)
+    target_link_libraries(graphot_core_internal PUBLIC OpenMP::OpenMP_CXX)
+    target_compile_definitions(graphot_core_internal PUBLIC GRAPHOT_USE_OPENMP=1)
   else()
     message(WARNING "GRAPHOT_ENABLE_OPENMP=ON but OpenMP was not found; building single-threaded core")
   endif()
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(graphot_core_internal PRIVATE -O3 -Wall -Wextra -Wpedantic)
   target_compile_options(_core PRIVATE -O3 -Wall -Wextra -Wpedantic)
 endif()
 

@@ -145,7 +145,9 @@ class OTConfig:
     """Solver configuration for the PDHG-based dynamic OT solve.
 
     ``numerics_mode`` is retained only as a compatibility field and accepts
-    only ``"paper"``.
+    only ``"paper"``. ``warm_start="harmonic_socp"`` uses a Python-side
+    MOSEK harmonic-mean SOCP to build an initial state before the C++ log-mean
+    PDHG iterations begin.
     """
 
     tau: float = 0.95
@@ -165,6 +167,7 @@ class OTConfig:
     cg_preconditioner: str = "jacobi"
     numerics_mode: str = "paper"
     record_debug_trace: bool = False
+    verbose: bool = False
 
     def __post_init__(self) -> None:
         if self.tau <= 0 or self.sigma <= 0:
@@ -173,8 +176,8 @@ class OTConfig:
             raise ValueError("tau * sigma must be strictly less than 1")
         if not 0.0 <= self.relaxation <= 1.0:
             raise ValueError("relaxation must lie in [0, 1]")
-        if self.warm_start not in {"linear_path", "zero"}:
-            raise ValueError("warm_start must be 'linear_path' or 'zero'")
+        if self.warm_start not in {"linear_path", "zero", "harmonic_socp"}:
+            raise ValueError("warm_start must be 'linear_path', 'zero', or 'harmonic_socp'")
         if self.max_iters <= 0 or self.check_every <= 0:
             raise ValueError("max_iters and check_every must be positive")
         if self.tol is not None:
@@ -238,6 +241,8 @@ class OTDebugTrace:
     continuity_residual: Array
     primal_delta: Array
     dual_delta: Array
+    k_violation: Array
+    endpoint_residual: Array
     max_constraint_residual: Array
     ceh_cg_residual: Array
     ceh_cg_iters: Array
@@ -256,3 +261,17 @@ class OTSolution:
     converged: bool
     diagnostics: dict[str, Any]
     debug_trace: OTDebugTrace | None = None
+
+
+@dataclass(frozen=True)
+class HarmonicWarmStartResult:
+    """Harmonic-mean SOCP warm start and its compact diagnostics."""
+
+    state: OTState
+    objective: float
+    continuity_residual: float
+    endpoint_residual: float
+    min_rho: float
+    min_rho_bar: float
+    solve_status: str
+    export_path: str | None = None

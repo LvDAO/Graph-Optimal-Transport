@@ -1,55 +1,90 @@
 # Numerical Limitations
 
-`graphot` is useful today, but it is not a solver for every graph transport
-setting.
+`graphot` is usable today, but it is still an early-stage scientific solver.
 
-## What It Handles Well
+This page is here to set expectations clearly before a long run.
 
-The current solver is a good fit for:
+## What It Handles Best
 
+The current package is a good fit for:
 - sparse reversible graphs,
 - small and medium examples,
-- exploratory transport studies,
-- runs where you want the full path, not just a static coupling.
+- research and exploratory workflows,
+- runs where you want the full time-dependent path.
 
-## What It Does Not Handle
+## What It Does Not Target
 
-The current project does not target:
-
+The current public solver does not target:
 - nonreversible graphs,
 - GPU execution,
 - entropy-regularized OT,
 - static coupling OT,
-- very large production-scale graph problems by default.
+- or very large production workloads with default settings.
 
 ## Where You Should Be Careful
 
-Large graphs and sharp endpoint distributions can still be difficult.
+The hardest problems today are usually:
+- larger grids,
+- many time steps,
+- very sharp endpoint masses,
+- runs whose debug trace drives `min_vartheta` toward zero.
 
 Typical warning signs are:
-
 - `solution.converged` stays `False`,
 - `solution.distance` becomes non-finite,
-- the debug trace shows `min_vartheta` collapsing toward zero.
+- `solution.debug_trace.action` becomes `inf`,
+- `ceh_cg_iters` repeatedly hits `cg_max_iters`.
 
-This usually means the run is becoming numerically singular.
+## Large-Grid Runs
 
-## Practical Advice For Harder Problems
+Large-grid runs are supported as exploratory examples, not as guaranteed
+out-of-the-box workloads.
 
-If a larger problem is unstable:
+In practice, you should expect to tune:
+- `max_iters`,
+- `cg_max_iters`,
+- `num_steps`,
+- and sometimes the warm-start strategy.
 
-- reduce `num_steps`,
-- increase `max_iters`,
-- increase `cg_max_iters`,
-- smooth the endpoint masses,
-- enable `record_debug_trace=True`.
+For release-facing user expectations, the safest message is:
+- small examples should be the first experience,
+- large-grid experiments are possible,
+- but they are the most numerically demanding part of the package.
 
-It is better to get a smaller version of the problem converging first and only
-then scale it up.
+## Harmonic Warm Start
 
-## Recommended Expectation
+`warm_start="harmonic_socp"` can be useful on harder problems, but it is not a
+guaranteed fix for large-grid instability.
 
-Treat large-grid runs as exploratory rather than guaranteed-default workloads.
+It also requires:
+- `mosek.fusion`,
+- and a valid MOSEK license.
 
-For the cleanest first experience, start with the small examples shipped in the
-repository.
+Use it as an optional advanced tool, not as the baseline path for first-time
+users.
+
+## Practical Advice
+
+If a problem is unstable:
+
+1. reduce `num_steps`,
+2. increase `cg_max_iters`,
+3. increase `max_iters`,
+4. smooth the endpoint masses,
+5. enable a debug trace,
+6. compare warm-start modes on the same case.
+
+It is usually better to get a smaller or smoother version of the same problem
+to converge cleanly before scaling up.
+
+## Scaling Intuition
+
+Runtime and memory both grow quickly as you increase:
+- `num_steps`
+- `num_nodes`
+- `num_edges`
+
+In practical terms:
+- doubling `num_steps` makes both the path state and the inner linear work noticeably heavier,
+- larger sparse graphs are usually manageable only when you keep `num_steps` conservative,
+- the large-grid example is best treated as a tuning workflow, not as a default one-shot solve.

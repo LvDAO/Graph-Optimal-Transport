@@ -6,6 +6,7 @@ import math
 
 import numpy as np
 
+from .harmonic_warm_start import solve_harmonic_socp_warm_start
 from .means import LogMeanOps
 from .types import OTConfig, OTDebugTrace, OTProblem, OTSolution, OTState
 
@@ -144,6 +145,8 @@ def _wrap_cpp_result(payload: dict[str, object]) -> OTSolution:
             continuity_residual=np.asarray(trace_payload["continuity_residual"], dtype=np.float64),
             primal_delta=np.asarray(trace_payload["primal_delta"], dtype=np.float64),
             dual_delta=np.asarray(trace_payload["dual_delta"], dtype=np.float64),
+            k_violation=np.asarray(trace_payload["k_violation"], dtype=np.float64),
+            endpoint_residual=np.asarray(trace_payload["endpoint_residual"], dtype=np.float64),
             max_constraint_residual=np.asarray(
                 trace_payload["max_constraint_residual"],
                 dtype=np.float64,
@@ -217,6 +220,7 @@ def _solve_ot_cpp(
         str(config.cg_preconditioner),
         str(config.warm_start),
         bool(config.record_debug_trace),
+        bool(config.verbose),
         float(mean_ops.eps_diag),
         float(mean_ops.xi_max),
         int(mean_ops.newton_iters),
@@ -264,6 +268,8 @@ def solve_ot(
                 continuity_residual=np.array([0.0], dtype=np.float64),
                 primal_delta=np.array([0.0], dtype=np.float64),
                 dual_delta=np.array([0.0], dtype=np.float64),
+                k_violation=np.array([0.0], dtype=np.float64),
+                endpoint_residual=np.array([0.0], dtype=np.float64),
                 max_constraint_residual=np.array([0.0], dtype=np.float64),
                 ceh_cg_residual=np.array([0.0], dtype=np.float64),
                 ceh_cg_iters=np.array([0], dtype=np.int32),
@@ -280,4 +286,8 @@ def solve_ot(
             debug_trace=debug_trace,
         )
 
-    return _solve_ot_cpp(problem, config, initial_state=initial_state)
+    resolved_initial_state = initial_state
+    if resolved_initial_state is None and config.warm_start == "harmonic_socp":
+        resolved_initial_state = solve_harmonic_socp_warm_start(problem).state
+
+    return _solve_ot_cpp(problem, config, initial_state=resolved_initial_state)

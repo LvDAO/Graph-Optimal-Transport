@@ -41,6 +41,17 @@ def _parse_float_list(raw: str) -> tuple[float, ...]:
     return tuple(values)
 
 
+def _parse_int_list(raw: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for token in raw.split(","):
+        stripped = token.strip()
+        if stripped:
+            values.append(int(stripped))
+    if not values:
+        raise ValueError("expected at least one comma-separated integer value")
+    return tuple(values)
+
+
 def _normalize_continuation_epsilons(epsilons: tuple[float, ...]) -> tuple[float, ...]:
     normalized: list[float] = []
     previous = float("inf")
@@ -56,17 +67,20 @@ def _normalize_continuation_epsilons(epsilons: tuple[float, ...]) -> tuple[float
     return tuple(normalized)
 
 
-def _allocate_iteration_budget(total_iters: int, num_stages: int) -> tuple[int, ...]:
-    if total_iters <= 0:
-        raise ValueError("total_iters must be positive")
-    if num_stages <= 0:
-        raise ValueError("num_stages must be positive")
-    if total_iters < num_stages:
-        raise ValueError("total_iters must be at least the number of stages")
+def _normalize_sweep_steps(step_values: tuple[int, ...]) -> tuple[int, ...]:
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for step in step_values:
+        if step < 2:
+            raise ValueError("swept step counts must be at least 2")
+        if step not in seen:
+            normalized.append(int(step))
+            seen.add(int(step))
+    return tuple(normalized)
 
-    base = total_iters // num_stages
-    remainder = total_iters % num_stages
-    return tuple(base + (1 if idx < remainder else 0) for idx in range(num_stages))
+
+def _warm_start_suffix(warm_start: str) -> str:
+    return "" if warm_start == "linear_path" else f"_warm_{warm_start}"
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> Path:
@@ -81,44 +95,30 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]])
 @dataclass(frozen=True)
 class SweepCase:
     name: str
-    cg_preconditioner: str
-    relaxation: float
-    continuation_epsilons: tuple[float, ...]
-    warm_start: str = "linear_path"
+    num_steps: int
+    endpoint_epsilon: float
 
 
-def _default_sweep_cases(continuation_epsilons: tuple[float, ...]) -> dict[str, SweepCase]:
+def _default_sweep_cases(
+    side: int,
+    blob_size: int,
+    step_values: tuple[int, ...],
+    epsilons: tuple[float, ...],
+) -> dict[str, SweepCase]:
     return {
-        "large_jacobi": SweepCase(
-            name="large_jacobi",
-            cg_preconditioner="jacobi",
-            relaxation=1.0,
-            continuation_epsilons=(0.0,),
-        ),
-        "large_block_jacobi": SweepCase(
-            name="large_block_jacobi",
-            cg_preconditioner="block_jacobi",
-            relaxation=1.0,
-            continuation_epsilons=(0.0,),
-        ),
-        "large_block_jacobi_relaxed": SweepCase(
-            name="large_block_jacobi_relaxed",
-            cg_preconditioner="block_jacobi",
-            relaxation=0.9,
-            continuation_epsilons=(0.0,),
-        ),
-        "large_continuation_block_jacobi": SweepCase(
-            name="large_continuation_block_jacobi",
-            cg_preconditioner="block_jacobi",
-            relaxation=1.0,
-            continuation_epsilons=continuation_epsilons,
-        ),
-        "large_continuation_block_jacobi_relaxed": SweepCase(
-            name="large_continuation_block_jacobi_relaxed",
-            cg_preconditioner="block_jacobi",
-            relaxation=0.9,
-            continuation_epsilons=continuation_epsilons,
-        ),
+        (
+            f"large_grid_{side}x{side}_blob{blob_size}_steps"
+            f"{num_steps}_eps{_float_tag(epsilon)}"
+        ): SweepCase(
+            name=(
+                f"large_grid_{side}x{side}_blob{blob_size}_steps"
+                f"{num_steps}_eps{_float_tag(epsilon)}"
+            ),
+            num_steps=num_steps,
+            endpoint_epsilon=epsilon,
+        )
+        for num_steps in step_values
+        for epsilon in epsilons
     }
 
 
@@ -145,12 +145,21 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Run and compare demanding 32x32-style large-grid transport solves, including "
-            "warm-started continuation over endpoint relaxations."
+            "Run demanding 32x32-style large-grid transport sweeps over endpoint "
+            "regularization epsilon and optional time-step counts."
         )
     )
     parser.add_argument("--side", type=int, default=32, help="Side length of the square grid.")
     parser.add_argument("--steps", type=int, default=32, help="Number of time intervals.")
+    parser.add_argument(
+        "--sweep-steps",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated time-step counts to sweep. "
+            "Default: use the single value from --steps."
+        ),
+    )
     parser.add_argument(
         "--blob-size",
         type=int,
@@ -158,10 +167,17 @@ def main() -> None:
         help="Side length of the source and target corner mass blocks.",
     )
     parser.add_argument(
+        "--warm-start",
+        type=str,
+        choices=("linear_path", "zero", "harmonic_socp"),
+        default="linear_path",
+        help="Warm-start mode passed through to OTConfig.",
+    )
+    parser.add_argument(
         "--max-iters",
         type=int,
         default=409600,
-        help="Total iteration budget per sweep case. Continuation cases split this across stages.",
+        help="Maximum solver iterations for each sweep case.",
     )
     parser.add_argument(
         "--check-every",
@@ -188,12 +204,25 @@ def main() -> None:
         help="CG tolerance used by the CE_h projection.",
     )
     parser.add_argument(
+        "--cg-preconditioner",
+        type=str,
+        default="block_jacobi",
+        choices=("jacobi", "block_jacobi"),
+        help="Fixed CG preconditioner used for every sweep case.",
+    )
+    parser.add_argument(
+        "--relaxation",
+        type=float,
+        default=1.0,
+        help="Fixed PDHG relaxation used for every sweep case.",
+    )
+    parser.add_argument(
         "--continuation-epsilons",
         type=str,
         default="0.25,0.125,0.0625,0.03125,0.015625,0.0078125,0.0",
         help=(
-            "Nonincreasing endpoint-relaxation schedule for continuation cases. "
-            "Each stage uses (1 - eps) * rho + eps * I."
+            "Nonincreasing endpoint-relaxation values for the sweep. "
+            "Each case uses (1 - eps) * rho + eps * I."
         ),
     )
     parser.add_argument(
@@ -206,6 +235,7 @@ def main() -> None:
         ),
     )
     parser.set_defaults(debug_trace=True)
+    parser.set_defaults(verbose=True)
     parser.add_argument(
         "--debug-trace",
         dest="debug_trace",
@@ -217,6 +247,18 @@ def main() -> None:
         dest="debug_trace",
         action="store_false",
         help="Disable debug-trace recording and plotting.",
+    )
+    parser.add_argument(
+        "--verbose",
+        dest="verbose",
+        action="store_true",
+        help="Show the C++ solver progress bar during each sweep case.",
+    )
+    parser.add_argument(
+        "--no-verbose",
+        dest="verbose",
+        action="store_false",
+        help="Disable the C++ solver progress bar for the sweep.",
     )
     args = parser.parse_args()
 
@@ -230,7 +272,15 @@ def main() -> None:
     continuation_epsilons = _normalize_continuation_epsilons(
         _parse_float_list(args.continuation_epsilons)
     )
-    sweep_cases = _default_sweep_cases(continuation_epsilons)
+    sweep_steps = _normalize_sweep_steps(
+        _parse_int_list(args.sweep_steps) if args.sweep_steps.strip() else (args.steps,)
+    )
+    sweep_cases = _default_sweep_cases(
+        args.side,
+        args.blob_size,
+        sweep_steps,
+        continuation_epsilons,
+    )
     available_case_names = tuple(sweep_cases.keys())
     requested_case_names = (
         [name.strip() for name in args.case_names.split(",") if name.strip()]
@@ -251,180 +301,117 @@ def main() -> None:
     rho_a_base = block_density(graph, args.side, rows=source_rows, cols=source_cols)
     rho_b_base = block_density(graph, args.side, rows=target_rows, cols=target_cols)
     pi = np.asarray(graph.pi)
-    memory_mb = estimate_state_memory_bytes(graph, args.steps) / (1024.0 * 1024.0)
     output_dir = OUTPUT_DIR
+    estimated_memory_mb = {
+        num_steps: estimate_state_memory_bytes(graph, num_steps) / (1024.0 * 1024.0)
+        for num_steps in sweep_steps
+    }
 
     print(
         f"grid={args.side}x{args.side}, num_nodes={graph.num_nodes}, num_edges={graph.num_edges}, "
-        f"num_steps={args.steps}, blob_size={args.blob_size}"
+        f"default_num_steps={args.steps}, sweep_steps={sweep_steps}, blob_size={args.blob_size}"
     )
-    print(f"estimated_persistent_memory_mb={memory_mb:.2f}")
+    print(f"estimated_persistent_memory_mb_by_steps={estimated_memory_mb}")
     print(f"pi_min={float(np.min(pi)):.8e}, pi_max={float(np.max(pi)):.8e}")
-    print(f"continuation_epsilons={continuation_epsilons}")
+    print(f"sweep_epsilons={continuation_epsilons}")
+    print(
+        f"fixed_solver_settings={{'cg_preconditioner': '{args.cg_preconditioner}', "
+        f"'relaxation': {args.relaxation:.3f}, 'warm_start': '{args.warm_start}', "
+        f"'verbose': {args.verbose}}}"
+    )
     print(f"available_cases={available_case_names}")
     print(f"selected_cases={tuple(requested_case_names)}")
 
     summary_rows: list[dict[str, object]] = []
+    warm_start_suffix = _warm_start_suffix(args.warm_start)
 
     for case_name in requested_case_names:
         case = sweep_cases[case_name]
-        case_base_name = (
-            f"large_grid_{args.side}x{args.side}_blob{args.blob_size}_steps{args.steps}_{case.name}"
+        case_output_dir = output_dir / f"{case.name}{warm_start_suffix}"
+        rho_a = regularize_density(graph, rho_a_base, case.endpoint_epsilon)
+        rho_b = regularize_density(graph, rho_b_base, case.endpoint_epsilon)
+        config = OTConfig(
+            relaxation=args.relaxation,
+            warm_start=args.warm_start,
+            max_iters=args.max_iters,
+            check_every=args.check_every,
+            newton_iters=args.newton_iters,
+            cg_max_iters=args.cg_max_iters,
+            cg_tol=args.cg_tol,
+            cg_preconditioner=args.cg_preconditioner,
+            record_debug_trace=args.debug_trace,
+            verbose=args.verbose,
         )
-        stage_budgets = _allocate_iteration_budget(args.max_iters, len(case.continuation_epsilons))
-        stage_rows: list[dict[str, object]] = []
-        initial_state = None
-        final_solution = None
-        final_stage_trace_npz: Path | None = None
-        final_stage_trace_plot: Path | None = None
-
         print(
-            f"case={case.name}, cg_preconditioner={case.cg_preconditioner}, "
-            f"solver_relaxation={case.relaxation:.3f}, stage_budgets={stage_budgets}"
+            f"case={case.name}, num_steps={case.num_steps}, "
+            f"endpoint_epsilon={case.endpoint_epsilon:.8g}, warm_start={args.warm_start}, "
+            f"max_iters={args.max_iters}"
+        )
+        final_solution = solve_problem(
+            graph,
+            rho_a,
+            rho_b,
+            num_steps=case.num_steps,
+            config=config,
+        )
+        print(
+            summarize_solution(
+                f"{case.name}[steps={case.num_steps},eps={case.endpoint_epsilon:.8g}]",
+                final_solution,
+            )
         )
 
-        for stage_index, (epsilon, stage_max_iters) in enumerate(
-            zip(case.continuation_epsilons, stage_budgets, strict=True),
-            start=1,
-        ):
-            rho_a = regularize_density(graph, rho_a_base, epsilon)
-            rho_b = regularize_density(graph, rho_b_base, epsilon)
-            config = OTConfig(
-                relaxation=case.relaxation,
-                warm_start=case.warm_start,
-                max_iters=stage_max_iters,
-                check_every=args.check_every,
-                newton_iters=args.newton_iters,
-                cg_max_iters=args.cg_max_iters,
-                cg_tol=args.cg_tol,
-                cg_preconditioner=case.cg_preconditioner,
-                record_debug_trace=args.debug_trace,
+        debug_trace_npz = None
+        debug_trace_plot = None
+        if final_solution.debug_trace is not None:
+            debug_trace_npz = save_debug_trace_npz(
+                case_output_dir,
+                case.name,
+                final_solution.debug_trace,
             )
-            print(
-                f"case={case.name} stage={stage_index}/{len(stage_budgets)} "
-                f"endpoint_epsilon={epsilon:.8g} stage_max_iters={stage_max_iters}"
+            debug_trace_plot = save_debug_trace_plot(
+                case_output_dir,
+                case.name,
+                final_solution.debug_trace,
+                title=(
+                    f"Large grid transport ({args.side}x{args.side}, steps={case.num_steps}, "
+                    f"epsilon={case.endpoint_epsilon:.8g})"
+                ),
             )
-            final_solution = solve_problem(
-                graph,
-                rho_a,
-                rho_b,
-                num_steps=args.steps,
-                config=config,
-                initial_state=initial_state,
-            )
-            initial_state = final_solution.state
-            print(
-                summarize_solution(
-                    f"{case.name}[stage={stage_index},eps={epsilon:.8g}]",
-                    final_solution,
-                )
-            )
-
-            stage_trace_npz = None
-            stage_trace_plot = None
-            if final_solution.debug_trace is not None:
-                stage_trace_base_name = (
-                    f"{case_base_name}_stage{stage_index:02d}_eps{_float_tag(epsilon)}"
-                )
-                stage_trace_npz = save_debug_trace_npz(
-                    output_dir,
-                    stage_trace_base_name,
-                    final_solution.debug_trace,
-                )
-                stage_trace_plot = save_debug_trace_plot(
-                    output_dir,
-                    stage_trace_base_name,
-                    final_solution.debug_trace,
-                    title=(
-                        f"Large grid transport ({args.side}x{args.side}, {case.name}): "
-                        f"stage {stage_index} trace at epsilon={epsilon:.8g}"
-                    ),
-                )
-                final_stage_trace_npz = stage_trace_npz
-                final_stage_trace_plot = stage_trace_plot
-
-            stage_rows.append(
-                {
-                    "case_name": case.name,
-                    "stage_index": stage_index,
-                    "num_stages": len(stage_budgets),
-                    "endpoint_epsilon": epsilon,
-                    "stage_max_iters": stage_max_iters,
-                    "iterations_used": final_solution.iterations_used,
-                    "converged": final_solution.converged,
-                    "distance": float(final_solution.distance),
-                    "action": float(final_solution.action),
-                    "continuity_residual": float(final_solution.diagnostics["continuity_residual"]),
-                    "max_constraint_residual": float(
-                        final_solution.diagnostics["max_constraint_residual"]
-                    ),
-                    "ceh_cg_residual": float(final_solution.diagnostics["ceh_cg_residual"]),
-                    "ceh_cg_iters": int(final_solution.diagnostics["ceh_cg_iters"]),
-                    "debug_trace_npz": str(stage_trace_npz) if stage_trace_npz is not None else "",
-                    "debug_trace_plot": (
-                        str(stage_trace_plot) if stage_trace_plot is not None else ""
-                    ),
-                }
-            )
-
-        if final_solution is None:
-            raise RuntimeError(f"case {case.name} produced no solution")
 
         rho = np.asarray(final_solution.state.rho)
-        state_path = save_solution(output_dir, case_base_name, final_solution)
+        state_path = save_solution(case_output_dir, case.name, final_solution)
         node_plot = save_node_mass_heatmap(
-            output_dir,
-            case_base_name,
+            case_output_dir,
+            case.name,
             graph,
             final_solution,
             title=(
-                f"Large grid transport ({args.side}x{args.side}, {case.name}): "
-                "probability mass over time"
+                f"Large grid transport ({args.side}x{args.side}, steps={case.num_steps}, "
+                f"epsilon={case.endpoint_epsilon:.8g}): regularized probability mass over time"
             ),
         )
         flow_plot = save_edge_flow_heatmap(
-            output_dir,
-            case_base_name,
+            case_output_dir,
+            case.name,
             graph,
             final_solution,
             title=(
-                f"Large grid transport ({args.side}x{args.side}, {case.name}): "
-                "edge flow over time"
+                f"Large grid transport ({args.side}x{args.side}, steps={case.num_steps}, "
+                f"epsilon={case.endpoint_epsilon:.8g}): edge flow over time"
             ),
         )
         graph_plot = save_graph_snapshot_series(
-            output_dir,
-            case_base_name,
+            case_output_dir,
+            case.name,
             graph,
             final_solution,
             positions=grid_layout(args.side),
             title=(
-                f"Large grid transport ({args.side}x{args.side}, {case.name}): "
-                "graph snapshots (node area scales with density)"
+                f"Large grid transport ({args.side}x{args.side}, steps={case.num_steps}, "
+                f"epsilon={case.endpoint_epsilon:.8g}): regularized endpoint and midpoint snapshots"
             ),
             snapshot_indices=(0, rho.shape[0] // 2, rho.shape[0] - 1),
-        )
-
-        stage_summary_path = _write_csv(
-            output_dir / f"{case_base_name}_stage_summary.csv",
-            [
-                "case_name",
-                "stage_index",
-                "num_stages",
-                "endpoint_epsilon",
-                "stage_max_iters",
-                "iterations_used",
-                "converged",
-                "distance",
-                "action",
-                "continuity_residual",
-                "max_constraint_residual",
-                "ceh_cg_residual",
-                "ceh_cg_iters",
-                "debug_trace_npz",
-                "debug_trace_plot",
-            ],
-            stage_rows,
         )
 
         node_mass = probability_mass(graph, final_solution)
@@ -441,88 +428,88 @@ def main() -> None:
             rows=target_rows,
             cols=target_cols,
         )
-        total_iterations_used = int(sum(int(row["iterations_used"]) for row in stage_rows))
-        summary_rows.append(
-            {
-                "case_name": case.name,
-                "cg_preconditioner": case.cg_preconditioner,
-                "solver_relaxation": case.relaxation,
-                "continuation_epsilons": "|".join(
-                    f"{epsilon:.8g}" for epsilon in case.continuation_epsilons
-                ),
-                "total_iteration_budget": args.max_iters,
-                "total_iterations_used": total_iterations_used,
-                "final_converged": final_solution.converged,
-                "final_distance": float(final_solution.distance),
-                "final_action": float(final_solution.action),
-                "final_continuity_residual": float(
-                    final_solution.diagnostics["continuity_residual"]
-                ),
-                "final_max_constraint_residual": float(
-                    final_solution.diagnostics["max_constraint_residual"]
-                ),
-                "final_ceh_cg_residual": float(final_solution.diagnostics["ceh_cg_residual"]),
-                "final_ceh_cg_iters": int(final_solution.diagnostics["ceh_cg_iters"]),
-                "midpoint_source_mass": source_midpoint_mass,
-                "midpoint_target_mass": target_midpoint_mass,
-                "saved_state": str(state_path),
-                "saved_node_plot": str(node_plot),
-                "saved_flow_plot": str(flow_plot),
-                "saved_graph_plot": str(graph_plot),
-                "saved_stage_summary": str(stage_summary_path),
-                "saved_final_debug_trace_npz": (
-                    str(final_stage_trace_npz) if final_stage_trace_npz is not None else ""
-                ),
-                "saved_final_debug_trace_plot": (
-                    str(final_stage_trace_plot) if final_stage_trace_plot is not None else ""
-                ),
-            }
+        case_row = {
+            "case_name": case.name,
+            "warm_start": args.warm_start,
+            "num_steps": case.num_steps,
+            "endpoint_epsilon": case.endpoint_epsilon,
+            "cg_preconditioner": args.cg_preconditioner,
+            "solver_relaxation": args.relaxation,
+            "max_iters": args.max_iters,
+            "iterations_used": final_solution.iterations_used,
+            "converged": final_solution.converged,
+            "distance": float(final_solution.distance),
+            "action": float(final_solution.action),
+            "continuity_residual": float(final_solution.diagnostics["continuity_residual"]),
+            "max_constraint_residual": float(final_solution.diagnostics["max_constraint_residual"]),
+            "ceh_cg_residual": float(final_solution.diagnostics["ceh_cg_residual"]),
+            "ceh_cg_iters": int(final_solution.diagnostics["ceh_cg_iters"]),
+            "midpoint_source_mass": source_midpoint_mass,
+            "midpoint_target_mass": target_midpoint_mass,
+            "case_output_dir": str(case_output_dir),
+            "saved_state": str(state_path),
+            "saved_node_plot": str(node_plot),
+            "saved_flow_plot": str(flow_plot),
+            "saved_graph_plot": str(graph_plot),
+            "saved_debug_trace_npz": str(debug_trace_npz) if debug_trace_npz is not None else "",
+            "saved_debug_trace_plot": str(debug_trace_plot) if debug_trace_plot is not None else "",
+        }
+        case_summary_path = _write_csv(
+            case_output_dir / "case_summary.csv",
+            list(case_row.keys()),
+            [case_row],
         )
+        case_row["saved_case_summary"] = str(case_summary_path)
+        summary_rows.append(case_row)
 
         print(
             "midpoint_corner_masses="
             f"{{'case': '{case.name}', 'source': {source_midpoint_mass:.8f}, "
             f"'target': {target_midpoint_mass:.8f}}}"
         )
+        print(f"case_output_dir={case_output_dir}")
         print(f"saved_state={state_path}")
         print(f"saved_node_plot={node_plot}")
         print(f"saved_flow_plot={flow_plot}")
         print(f"saved_graph_plot={graph_plot}")
-        print(f"saved_stage_summary={stage_summary_path}")
-        if final_stage_trace_npz is not None:
-            print(f"saved_final_debug_trace_npz={final_stage_trace_npz}")
-        if final_stage_trace_plot is not None:
-            print(f"saved_final_debug_trace_plot={final_stage_trace_plot}")
+        print(f"saved_case_summary={case_summary_path}")
+        if debug_trace_npz is not None:
+            print(f"saved_debug_trace_npz={debug_trace_npz}")
+        if debug_trace_plot is not None:
+            print(f"saved_debug_trace_plot={debug_trace_plot}")
 
     sweep_summary_path = _write_csv(
         output_dir
         / (
             f"large_grid_{args.side}x{args.side}_blob{args.blob_size}"
-            f"_steps{args.steps}_sweep_summary.csv"
+            f"{warm_start_suffix}_sweep_summary.csv"
         ),
         [
             "case_name",
+            "warm_start",
+            "num_steps",
+            "endpoint_epsilon",
             "cg_preconditioner",
             "solver_relaxation",
-            "continuation_epsilons",
-            "total_iteration_budget",
-            "total_iterations_used",
-            "final_converged",
-            "final_distance",
-            "final_action",
-            "final_continuity_residual",
-            "final_max_constraint_residual",
-            "final_ceh_cg_residual",
-            "final_ceh_cg_iters",
+            "max_iters",
+            "iterations_used",
+            "converged",
+            "distance",
+            "action",
+            "continuity_residual",
+            "max_constraint_residual",
+            "ceh_cg_residual",
+            "ceh_cg_iters",
             "midpoint_source_mass",
             "midpoint_target_mass",
+            "case_output_dir",
             "saved_state",
             "saved_node_plot",
             "saved_flow_plot",
             "saved_graph_plot",
-            "saved_stage_summary",
-            "saved_final_debug_trace_npz",
-            "saved_final_debug_trace_plot",
+            "saved_debug_trace_npz",
+            "saved_debug_trace_plot",
+            "saved_case_summary",
         ],
         summary_rows,
     )
@@ -530,13 +517,13 @@ def main() -> None:
     best_row = min(
         summary_rows,
         key=lambda row: (
-            not bool(row["final_converged"]),
+            not bool(row["converged"]),
             float("inf")
-            if not np.isfinite(float(row["final_max_constraint_residual"]))
-            else float(row["final_max_constraint_residual"]),
+            if not np.isfinite(float(row["max_constraint_residual"]))
+            else float(row["max_constraint_residual"]),
             float("inf")
-            if not np.isfinite(float(row["final_action"]))
-            else float(row["final_action"]),
+            if not np.isfinite(float(row["action"]))
+            else float(row["action"]),
         ),
     )
     print(f"best_case={best_row['case_name']}")

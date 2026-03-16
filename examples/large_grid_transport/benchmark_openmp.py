@@ -65,7 +65,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cg-tol", type=float, default=1e-10)
     parser.add_argument("--cg-preconditioner", type=str, default="block_jacobi")
     parser.add_argument("--relaxation", type=float, default=1.0)
-    parser.add_argument("--warm-start", type=str, default="linear_path")
+    parser.add_argument(
+        "--warm-start",
+        type=str,
+        choices=("linear_path", "zero", "harmonic_socp"),
+        default="linear_path",
+        help="`harmonic_socp` requires a working MOSEK Fusion installation and license.",
+    )
     parser.add_argument("--threads", type=str, default="")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup-runs", type=int, default=1)

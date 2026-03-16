@@ -195,6 +195,8 @@ def save_debug_trace_npz(output_dir: Path, name: str, debug_trace) -> Path:
         continuity_residual=np.asarray(debug_trace.continuity_residual),
         primal_delta=np.asarray(debug_trace.primal_delta),
         dual_delta=np.asarray(debug_trace.dual_delta),
+        k_violation=np.asarray(debug_trace.k_violation),
+        endpoint_residual=np.asarray(debug_trace.endpoint_residual),
         max_constraint_residual=np.asarray(debug_trace.max_constraint_residual),
         ceh_cg_residual=np.asarray(debug_trace.ceh_cg_residual),
         ceh_cg_iters=np.asarray(debug_trace.ceh_cg_iters),
@@ -204,6 +206,33 @@ def save_debug_trace_npz(output_dir: Path, name: str, debug_trace) -> Path:
     return path
 
 
+def _all_finite_positive(*series: np.ndarray) -> bool:
+    finite = [np.asarray(values)[np.isfinite(values)] for values in series]
+    if not any(values.size for values in finite):
+        return False
+    return all(np.all(values > 0.0) for values in finite if values.size)
+
+
+def _plot_trace_panel(
+    ax,
+    iterations: np.ndarray,
+    title: str,
+    ylabel: str,
+    series: list[tuple[str, np.ndarray]],
+    *,
+    log_if_positive: bool = False,
+) -> None:
+    for label, values in series:
+        ax.plot(iterations, values, marker="o", linewidth=2.0, markersize=3.5, label=label)
+    if log_if_positive and _all_finite_positive(*(values for _, values in series)):
+        ax.set_yscale("log")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    if len(series) > 1:
+        ax.legend(fontsize=8)
+
+
 def save_debug_trace_plot(output_dir: Path, name: str, debug_trace, *, title: str) -> Path:
     output_dir = ensure_output_dir(output_dir)
     path = output_dir / f"{name}_debug_trace.png"
@@ -211,41 +240,100 @@ def save_debug_trace_plot(output_dir: Path, name: str, debug_trace, *, title: st
     iterations = np.asarray(debug_trace.iterations)[:num_records]
     action = np.asarray(debug_trace.action)[:num_records]
     continuity = np.asarray(debug_trace.continuity_residual)[:num_records]
+    primal_delta = np.asarray(debug_trace.primal_delta)[:num_records]
+    dual_delta = np.asarray(debug_trace.dual_delta)[:num_records]
+    k_violation = np.asarray(debug_trace.k_violation)[:num_records]
+    endpoint_residual = np.asarray(debug_trace.endpoint_residual)[:num_records]
+    max_constraint = np.asarray(debug_trace.max_constraint_residual)[:num_records]
+    ceh_cg_residual = np.asarray(debug_trace.ceh_cg_residual)[:num_records]
+    ceh_cg_iters = np.asarray(debug_trace.ceh_cg_iters)[:num_records]
+    min_vartheta = np.asarray(debug_trace.min_vartheta)[:num_records]
 
-    fig, axes = plt.subplots(2, 1, figsize=(8, 6.5), sharex=True)
+    fig, axes = plt.subplots(3, 2, figsize=(11.5, 10.0), sharex=True)
+    axes_flat = axes.flat
     if num_records == 0:
-        for ax in axes:
+        for ax in axes_flat:
             ax.axis("off")
         fig.suptitle(title)
-        axes[0].text(
+        axes[0, 0].text(
             0.5,
             0.5,
             "no trace records",
             ha="center",
             va="center",
-            transform=axes[0].transAxes,
+            transform=axes[0, 0].transAxes,
         )
-        fig.tight_layout()
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
         fig.savefig(path, dpi=160)
         plt.close(fig)
         return path
 
-    axes[0].plot(iterations, action, marker="o", linewidth=2.0, markersize=4.0)
-    axes[0].set_ylabel("action")
-    axes[0].grid(True, alpha=0.25)
-    axes[0].set_title("Action")
+    _plot_trace_panel(axes[0, 0], iterations, "Action", "action", [("action", action)])
+    _plot_trace_panel(
+        axes[0, 1],
+        iterations,
+        "Primal / Dual Delta",
+        "delta",
+        [("primal_delta", primal_delta), ("dual_delta", dual_delta)],
+        log_if_positive=True,
+    )
+    _plot_trace_panel(
+        axes[1, 0],
+        iterations,
+        "Continuity / Max Constraint",
+        "residual",
+        [("continuity", continuity), ("max_constraint", max_constraint)],
+        log_if_positive=True,
+    )
+    _plot_trace_panel(
+        axes[1, 1],
+        iterations,
+        "K Violation / Endpoint Residual",
+        "residual",
+        [("k_violation", k_violation), ("endpoint", endpoint_residual)],
+        log_if_positive=True,
+    )
+    _plot_trace_panel(
+        axes[2, 0],
+        iterations,
+        "CEH CG Residual",
+        "residual",
+        [("ceh_cg_residual", ceh_cg_residual)],
+        log_if_positive=True,
+    )
 
-    axes[1].plot(iterations, continuity, marker="o", linewidth=2.0, markersize=4.0)
-    continuity_positive = np.isfinite(continuity) & (continuity > 0.0)
-    if np.all(continuity_positive):
-        axes[1].set_yscale("log")
-    axes[1].set_ylabel("continuity residual")
-    axes[1].set_xlabel("solver iteration")
-    axes[1].grid(True, alpha=0.25)
-    axes[1].set_title("Continuity Residual")
+    axes[2, 1].plot(
+        iterations,
+        min_vartheta,
+        marker="o",
+        linewidth=2.0,
+        markersize=3.5,
+        color="tab:blue",
+        label="min_vartheta",
+    )
+    axes[2, 1].axhline(0.0, color="black", linewidth=1.0, alpha=0.35)
+    axes[2, 1].set_ylabel("min vartheta")
+    axes[2, 1].set_title("Min Vartheta / CG Iters")
+    axes[2, 1].grid(True, alpha=0.25)
+    cg_ax = axes[2, 1].twinx()
+    cg_ax.step(
+        iterations,
+        ceh_cg_iters,
+        where="mid",
+        linewidth=1.7,
+        color="tab:orange",
+        label="ceh_cg_iters",
+    )
+    cg_ax.set_ylabel("cg iters")
+    lines_left, labels_left = axes[2, 1].get_legend_handles_labels()
+    lines_right, labels_right = cg_ax.get_legend_handles_labels()
+    axes[2, 1].legend(lines_left + lines_right, labels_left + labels_right, fontsize=8, loc="best")
+
+    axes[2, 0].set_xlabel("solver iteration")
+    axes[2, 1].set_xlabel("solver iteration")
 
     fig.suptitle(title)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     fig.savefig(path, dpi=160)
     plt.close(fig)
     return path

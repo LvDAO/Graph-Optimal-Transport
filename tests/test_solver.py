@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import graphot.solver as solver_module
 from graphot import (
     GraphSpec,
     LogMeanOps,
     OTConfig,
     OTProblem,
     TimeDiscretization,
+    solve_harmonic_socp_warm_start,
     solve_ot,
 )
 
@@ -110,6 +114,29 @@ print(json.dumps(_core.extension_info(), sort_keys=True))
     return json.loads(completed.stdout.strip())
 
 
+@lru_cache(maxsize=1)
+def _mosek_runtime_available() -> bool:
+    try:
+        from mosek.fusion import Domain, Expr, Model, ObjectiveSense
+    except ImportError:
+        return False
+
+    try:
+        with Model("mosek_test_license") as model:
+            x = model.variable("x", 1, Domain.greaterThan(0.0))
+            model.constraint(Expr.sub(x, 1.0), Domain.equalsTo(0.0))
+            model.objective(ObjectiveSense.Minimize, Expr.sum(x))
+            model.solve()
+            level = np.asarray(x.level(), dtype=np.float64)
+    except Exception:
+        return False
+
+    return level.shape == (1,) and np.isfinite(level[0]) and abs(float(level[0]) - 1.0) <= 1e-9
+
+
+_MOSEK_SKIP_REASON = "MOSEK Fusion runtime or license unavailable"
+
+
 @pytest.fixture(scope="module")
 def debug_trace_solution():
     problem = _two_node_problem(-0.2, 0.2, num_steps=12)
@@ -121,6 +148,7 @@ def debug_trace_solution():
 
 def test_config_defaults_to_paper_mode() -> None:
     assert OTConfig().numerics_mode == "paper"
+    assert OTConfig().verbose is False
 
 
 def test_config_accepts_explicit_paper_mode() -> None:
@@ -131,9 +159,21 @@ def test_config_accepts_block_jacobi_preconditioner() -> None:
     assert OTConfig(cg_preconditioner="block_jacobi").cg_preconditioner == "block_jacobi"
 
 
+def test_config_accepts_harmonic_socp_warm_start() -> None:
+    assert OTConfig(warm_start="harmonic_socp").warm_start == "harmonic_socp"
+
+
 def test_config_rejects_legacy_mode_with_migration_message() -> None:
     with pytest.raises(ValueError, match="legacy mode has been removed; use numerics_mode='paper'"):
         OTConfig(numerics_mode="legacy")
+
+
+def test_config_rejects_unknown_warm_start() -> None:
+    with pytest.raises(
+        ValueError,
+        match="warm_start must be 'linear_path', 'zero', or 'harmonic_socp'",
+    ):
+        OTConfig(warm_start="not_a_mode")
 
 
 def test_openmp_defaults_to_all_available_threads_when_thread_envs_are_unset() -> None:
@@ -210,6 +250,175 @@ def test_solver_accepts_explicit_initial_state() -> None:
     assert warm_started_solution.converged
     assert np.isfinite(warm_started_solution.action)
     assert abs(float(direct_solution.distance) - float(warm_started_solution.distance)) < 1e-8
+
+
+def test_explicit_initial_state_records_iteration_zero_debug_trace() -> None:
+    seed_problem = _two_node_problem(-0.2, 0.2, num_steps=16)
+    target_problem = _two_node_problem(-0.1, 0.3, num_steps=16)
+    seed_solution = solve_ot(
+        seed_problem,
+        OTConfig(max_iters=240, check_every=10, tol=1e-8, cg_max_iters=96),
+    )
+    initial_action = float(solver_module.compute_action(target_problem, seed_solution.state))
+
+    solution = solve_ot(
+        target_problem,
+        OTConfig(
+            max_iters=1,
+            check_every=1,
+            residual_tol=1e-12,
+            feasibility_tol=1e-12,
+            cg_max_iters=96,
+            record_debug_trace=True,
+        ),
+        initial_state=seed_solution.state,
+    )
+
+    trace = solution.debug_trace
+    assert trace is not None
+    valid_iterations = np.asarray(trace.iterations)[: trace.num_records]
+    valid_action = np.asarray(trace.action)[: trace.num_records]
+    valid_ceh_cg_iters = np.asarray(trace.ceh_cg_iters)[: trace.num_records]
+
+    assert solution.iterations_used == 1
+    assert trace.num_records == 2
+    assert valid_iterations.tolist() == [0, 1]
+    assert valid_action[0] == pytest.approx(initial_action)
+    assert np.isfinite(valid_action[0])
+    assert int(valid_ceh_cg_iters[0]) > 0
+
+
+def test_explicit_initial_state_skips_phi_bootstrap_when_cg_warm_start_disabled() -> None:
+    seed_problem = _two_node_problem(-0.2, 0.2, num_steps=16)
+    target_problem = _two_node_problem(-0.1, 0.3, num_steps=16)
+    seed_solution = solve_ot(
+        seed_problem,
+        OTConfig(max_iters=240, check_every=10, tol=1e-8, cg_max_iters=96),
+    )
+    initial_action = float(solver_module.compute_action(target_problem, seed_solution.state))
+
+    solution = solve_ot(
+        target_problem,
+        OTConfig(
+            max_iters=1,
+            check_every=1,
+            residual_tol=1e-12,
+            feasibility_tol=1e-12,
+            cg_max_iters=96,
+            cg_warm_start=False,
+            record_debug_trace=True,
+        ),
+        initial_state=seed_solution.state,
+    )
+
+    trace = solution.debug_trace
+    assert trace is not None
+    valid_iterations = np.asarray(trace.iterations)[: trace.num_records]
+    valid_action = np.asarray(trace.action)[: trace.num_records]
+    valid_ceh_cg_iters = np.asarray(trace.ceh_cg_iters)[: trace.num_records]
+    valid_ceh_cg_residual = np.asarray(trace.ceh_cg_residual)[: trace.num_records]
+
+    assert solution.iterations_used == 1
+    assert trace.num_records == 2
+    assert valid_iterations.tolist() == [0, 1]
+    assert valid_action[0] == pytest.approx(initial_action)
+    assert int(valid_ceh_cg_iters[0]) == 0
+    assert float(valid_ceh_cg_residual[0]) == 0.0
+
+
+@pytest.mark.skipif(not _mosek_runtime_available(), reason=_MOSEK_SKIP_REASON)
+def test_harmonic_socp_warm_start_returns_valid_state() -> None:
+    problem = _two_node_problem(-0.2, 0.2, num_steps=10)
+    result = solve_harmonic_socp_warm_start(problem)
+
+    assert result.state.rho.shape == (problem.time.num_steps + 1, problem.graph.num_nodes)
+    assert result.state.m.shape == (problem.time.num_steps, problem.graph.num_edges)
+    assert result.state.rho_bar.shape == (problem.time.num_steps, problem.graph.num_nodes)
+    assert np.isfinite(result.objective)
+    assert result.continuity_residual < 1e-7
+    assert result.endpoint_residual < 1e-9
+    assert result.min_rho > -1e-8
+    assert result.min_rho_bar > -1e-8
+    assert "Feasible" in result.solve_status or "Optimal" in result.solve_status
+
+
+@pytest.mark.skipif(not _mosek_runtime_available(), reason=_MOSEK_SKIP_REASON)
+def test_harmonic_socp_warm_start_can_export_npz(tmp_path: Path) -> None:
+    problem = _two_node_problem(-0.1, 0.3, num_steps=8)
+    export_path = tmp_path / "harmonic_warm_start"
+    result = solve_harmonic_socp_warm_start(problem, export_path=export_path)
+
+    assert result.export_path is not None
+    saved_path = Path(result.export_path)
+    assert saved_path.exists()
+
+    with np.load(saved_path) as payload:
+        assert {
+            "rho",
+            "m",
+            "vartheta",
+            "rho_minus",
+            "rho_plus",
+            "rho_bar",
+            "q_node",
+            "objective",
+            "continuity_residual",
+            "endpoint_residual",
+            "min_rho",
+            "min_rho_bar",
+            "solve_status",
+        }.issubset(payload.files)
+
+
+@pytest.mark.skipif(not _mosek_runtime_available(), reason=_MOSEK_SKIP_REASON)
+def test_solver_supports_harmonic_socp_warm_start() -> None:
+    problem = _two_node_problem(-0.2, 0.2, num_steps=16)
+    direct_config = OTConfig(max_iters=240, check_every=10, tol=1e-8, cg_max_iters=96)
+    harmonic_config = OTConfig(
+        max_iters=240,
+        check_every=10,
+        tol=1e-8,
+        cg_max_iters=96,
+        warm_start="harmonic_socp",
+    )
+
+    direct_solution = solve_ot(problem, direct_config)
+    harmonic_solution = solve_ot(problem, harmonic_config)
+
+    assert direct_solution.converged
+    assert harmonic_solution.converged
+    assert np.isfinite(harmonic_solution.action)
+    assert abs(float(direct_solution.distance) - float(harmonic_solution.distance)) < 1e-8
+
+
+@pytest.mark.skipif(not _mosek_runtime_available(), reason=_MOSEK_SKIP_REASON)
+def test_explicit_initial_state_takes_precedence_over_harmonic_socp(monkeypatch) -> None:
+    seed_problem = _two_node_problem(-0.2, 0.2, num_steps=12)
+    target_problem = _two_node_problem(-0.1, 0.3, num_steps=12)
+    seed_solution = solve_ot(seed_problem, OTConfig(max_iters=240, check_every=10, tol=1e-8))
+
+    def _unexpected_harmonic_call(problem: OTProblem):  # pragma: no cover - defensive guard
+        raise AssertionError(f"unexpected harmonic warm-start call for {problem}")
+
+    monkeypatch.setattr(
+        solver_module,
+        "solve_harmonic_socp_warm_start",
+        _unexpected_harmonic_call,
+    )
+
+    solution = solve_ot(
+        target_problem,
+        OTConfig(
+            max_iters=240,
+            check_every=10,
+            tol=1e-8,
+            cg_max_iters=96,
+            warm_start="harmonic_socp",
+        ),
+        initial_state=seed_solution.state,
+    )
+
+    assert solution.converged
 
 
 @pytest.mark.parametrize(
@@ -409,6 +618,8 @@ def test_solver_returns_debug_trace_when_enabled(debug_trace_solution) -> None:
         len(np.asarray(trace.continuity_residual)),
         len(np.asarray(trace.primal_delta)),
         len(np.asarray(trace.dual_delta)),
+        len(np.asarray(trace.k_violation)),
+        len(np.asarray(trace.endpoint_residual)),
         len(np.asarray(trace.max_constraint_residual)),
         len(np.asarray(trace.ceh_cg_residual)),
         len(np.asarray(trace.ceh_cg_iters)),
@@ -435,3 +646,22 @@ def test_solver_omits_debug_trace_when_disabled() -> None:
         ),
     )
     assert solution.debug_trace is None
+
+
+def test_solver_verbose_logs_checkpoint_iterations(capfd: pytest.CaptureFixture[str]) -> None:
+    problem = _two_node_problem(-0.2, 0.2, num_steps=12)
+    solution = solve_ot(
+        problem,
+        OTConfig(
+            max_iters=20,
+            check_every=5,
+            cg_max_iters=64,
+            verbose=True,
+        ),
+    )
+    assert solution.iterations_used > 0
+    captured = capfd.readouterr()
+    matches = re.findall(r"(\d+)/20", captured.err)
+    assert matches
+    assert all(int(step) % 5 == 0 for step in matches)
+    assert "graphot [" in captured.err

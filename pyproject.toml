@@ -1,6 +1,6 @@
 [project]
 name = "graphot"
-version = "0.0.3"
+version = "0.0.4"
 description = "Graph optimal transport on sparse reversible graphs"
 readme = "README.md"
 license = "MIT"
@@ -9,6 +9,7 @@ authors = [
   { name = "LvDAO" },
 ]
 dependencies = [
+  "mosek>=11.1.9",
   "numpy>=2.1",
   "scipy>=1.14",
 ]
@@ -84,7 +85,7 @@ src = ["src", "tests", "examples"]
 select = ["E", "F", "I"]
 
 [tool.bumpversion]
-current_version = "0.0.3"
+current_version = "0.0.4"
 parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
 serialize = ["{major}.{minor}.{patch}"]
 search = 'version = "{current_version}"'
